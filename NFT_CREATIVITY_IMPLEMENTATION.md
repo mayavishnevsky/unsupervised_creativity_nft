@@ -162,6 +162,37 @@ and a standard exported `default` LoRA. `_SUCCESS` and `checkpoints/latest`
 identify complete checkpoints. Resume restores this complete state at the next
 epoch (`flow_grpo/nft_creativity_runtime.py:243`).
 
+## RAM-aligned inputs
+
+`sd3_iem_same_prompt_partiprompts_ram_aligned` is an opt-in comparison preset.
+It aligns three inputs with RAM while leaving NFT's optimizer and 25-step DPM2
+candidate sampler intact:
+
+- Epoch prompt groups use the same one-file `BalancedPromptSampler` algorithm,
+  seed `config.seed + epoch`, order, and distributed striding as RAM.
+- Validation prompt selection uses seed `3_000_009`; validation latent seeds
+  continue to use RAM's prompt-specific hash with base seed 0.
+- IEM, CLIP, and DINO references are loaded from RAM's immutable cache. IEM
+  consumes the exact BF16 endpoint latents, while CLIP/DINO consume the exact
+  FP32 raw embeddings saved beside them.
+
+The reader requires the cache `_SUCCESS` marker and validates its specification
+hash, prompt-file digest, seed, resolution, reference count, baseline inference
+steps, guidance scale, and encoder model IDs. It never silently falls back to
+NFT generation when an aligned cache entry is absent or incompatible.
+
+This aligns reference endpoints, not NFT candidate endpoints. RAM uses a
+20-step Euler rollout and NFT uses a 25-step DPM2 rollout, so their final
+candidate latents should differ even when a later experiment supplies identical
+initial noise. Existing unaligned NFT presets still generate references through
+NFT's sampler and retain their prior behavior.
+
+On AirCC, select the aligned preset with:
+
+```bash
+sbatch --export=ALL,CONFIG_NAME=sd3_iem_same_prompt_partiprompts_ram_aligned,RUN_LABEL=nft_iem_ram_aligned experiment_scripts/run_nft_iem_same_prompt_full_aircc_b200_2gpu.sbatch
+```
+
 ## Presets
 
 The full and smoke presets are in `config/nft.py:145` and `config/nft.py:239`.

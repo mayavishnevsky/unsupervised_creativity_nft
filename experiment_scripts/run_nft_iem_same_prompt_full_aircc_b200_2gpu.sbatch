@@ -27,6 +27,7 @@ RAM_ROOT=/shared/home/users/vishnevsky/unsupervised_creativity_ram_aircc
 BASELINE_LORA="$RAM_ROOT/assets/cfg_distilled_sd35m_checkpoint12/lora"
 TRAIN_BETA="${TRAIN_BETA:-0.01}"
 REFERENCE_PROMPT_MODE="${REFERENCE_PROMPT_MODE:-same_prompt}"
+CONFIG_NAME="${CONFIG_NAME:-sd3_iem_same_prompt_partiprompts}"
 RUN_LABEL="${RUN_LABEL:-nft_iem_same_prompt_full}"
 RUN_DIR="$ROOT/runs/${RUN_LABEL}_${SLURM_JOB_ID}"
 NUM_GPUS=2
@@ -105,7 +106,7 @@ cd "$REPO"
   --nproc_per_node="$NUM_GPUS" \
   --master_port="$MASTER_PORT" \
   scripts/train_nft_creativity_sd3.py \
-  --config config/nft.py:sd3_iem_same_prompt_partiprompts \
+  --config "config/nft.py:${CONFIG_NAME}" \
   --config.baseline_lora_path="$BASELINE_LORA" \
   --config.creativity.reference_prompt_mode="$REFERENCE_PROMPT_MODE" \
   --config.train.beta="$TRAIN_BETA" \

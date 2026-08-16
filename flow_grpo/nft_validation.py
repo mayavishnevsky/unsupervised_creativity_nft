@@ -43,7 +43,9 @@ def render_fixed_validation(
     prompts = validation_prompts(
         config.validation.prompt_files,
         int(config.validation.prompt_count),
-        int(config.validation.base_seed),
+        int(
+            getattr(config.validation, "prompt_seed", config.validation.base_seed)
+        ),
     )
     model = pipeline.transformer
     if not baseline and config.train.ema and ema is not None:

@@ -319,6 +319,9 @@ def main(_):
         num_replicas=world_size,
         rank=rank,
         seed=config.seed,
+        ram_aligned=bool(
+            getattr(config.sample, "ram_aligned_prompt_sampling", False)
+        ),
     )
     if len(train_sampler) != int(config.sample.num_batches_per_epoch):
         raise ValueError(

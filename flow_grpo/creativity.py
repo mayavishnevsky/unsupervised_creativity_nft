@@ -23,6 +23,13 @@ from typing import Callable, Iterable, Sequence
 import torch
 import torch.nn.functional as F
 
+from flow_grpo.reference_cache import (
+    CLIP_KEY,
+    DINO_KEY,
+    LATENT_KEY,
+    ReferenceCacheReader,
+)
+
 
 Tensor = torch.Tensor
 
@@ -658,6 +665,19 @@ class IEMReward:
         )
         self._image_processor = None
         self._image_encoder = None
+        reference_cache_dir = getattr(config, "reference_cache_dir", None)
+        self.reference_cache = (
+            ReferenceCacheReader(
+                reference_cache_dir,
+                expected_spec_sha256=getattr(
+                    config,
+                    "reference_cache_spec_sha256",
+                    None,
+                ),
+            )
+            if reference_cache_dir
+            else None
+        )
         self.sigma_schedule = (
             iem_sigma_schedule(
                 config.sigma_min,
@@ -669,6 +689,8 @@ class IEMReward:
             else None
         )
         self._validate_config()
+        if self.reference_cache is not None:
+            self._validate_reference_cache()
         if self.reference_prompt_mode == "diverse":
             self.prompt_sampler = BalancedPromptSampler(
                 config.reference_prompt_files
@@ -759,6 +781,85 @@ class IEMReward:
             if not str(getattr(self.config, model_field, "")):
                 raise ValueError(f"creativity.{model_field} must be nonempty")
 
+    def _validate_reference_cache(self) -> None:
+        """Reject cached references generated with incompatible RAM inputs."""
+
+        if self.reference_prompt_mode != "same_prompt":
+            raise ValueError(
+                "creativity.reference_cache_dir is supported only with "
+                "reference_prompt_mode=same_prompt"
+            )
+        if self.distance_metric == "tpips_overall":
+            raise ValueError(
+                "the RAM reference cache contains IEM, CLIP, and DINO data, "
+                "not TPIPS embeddings"
+            )
+        candidate_prompt_files = getattr(
+            self.config,
+            "candidate_prompt_files",
+            None,
+        )
+        if not candidate_prompt_files:
+            raise ValueError(
+                "creativity.candidate_prompt_files is required when using "
+                "the RAM reference cache"
+            )
+        spec = self.reference_cache.spec
+        expected = {
+            "seed": int(self.config.seed),
+            "resolution": int(self.config.resolution),
+            "num_inference_steps": int(self.config.num_inference_steps),
+            "guidance_scale": float(self.config.guidance_scale),
+            "reference_samples_per_prompt": int(
+                self.config.reference_samples_per_prompt
+            ),
+            "prompt_source_sha256": BalancedPromptSampler(
+                candidate_prompt_files
+            ).source_sha256,
+        }
+        mismatches = {
+            name: (spec.get(name), value)
+            for name, value in expected.items()
+            if spec.get(name) != value
+        }
+        for name, model_id in {
+            "clip": str(self.config.clip_model_id),
+            "dino": str(self.config.dino_model_id),
+        }.items():
+            cached = spec.get(name)
+            if not isinstance(cached, dict) or cached.get("model_id") != model_id:
+                mismatches[f"{name}.model_id"] = (
+                    cached.get("model_id") if isinstance(cached, dict) else None,
+                    model_id,
+                )
+        if mismatches:
+            raise ValueError(
+                "RAM reference cache is incompatible with NFT creativity "
+                f"config: {mismatches}"
+            )
+
+    def _cached_references(
+        self,
+        *,
+        epoch: int,
+        prompt: str,
+        tensor_keys: Sequence[str],
+    ) -> dict[str, Tensor] | None:
+        if self.reference_cache is None:
+            return None
+        tensors = self.reference_cache.load(
+            epoch=epoch,
+            prompt=prompt,
+            tensor_keys=tensor_keys,
+        )
+        expected_count = int(self.config.reference_samples_per_prompt)
+        if any(tensor.shape[0] != expected_count for tensor in tensors.values()):
+            raise ValueError(
+                "RAM reference cache entry count does not match "
+                "reference_samples_per_prompt"
+            )
+        return tensors
+
     @staticmethod
     def _adapter_host(model):
         if hasattr(model, "disable_adapter"):
@@ -778,6 +879,10 @@ class IEMReward:
             "reference_selection_mode": self.reference_selection_mode,
             "nearest_reference_fraction": self.nearest_reference_fraction,
             **state,
+            **(
+                {"reference_cache_spec_sha256": self.reference_cache.spec_sha256}
+                if self.reference_cache is not None else {}
+            ),
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -803,6 +908,17 @@ class IEMReward:
                 "checkpoint creativity.reference_selection_mode "
                 f"is {saved_selection_mode!r}, but the current config uses "
                 f"{self.reference_selection_mode!r}"
+            )
+        saved_cache_sha256 = state.get("reference_cache_spec_sha256")
+        current_cache_sha256 = (
+            self.reference_cache.spec_sha256
+            if self.reference_cache is not None else None
+        )
+        if saved_cache_sha256 != current_cache_sha256:
+            raise ValueError(
+                "checkpoint creativity.reference_cache_spec_sha256 "
+                f"is {saved_cache_sha256!r}, but the current config uses "
+                f"{current_cache_sha256!r}"
             )
         if self.reference_selection_mode == "nearest":
             saved_fraction = float(state.get("nearest_reference_fraction", 0.1))
@@ -1254,6 +1370,7 @@ class IEMReward:
         reference_batch_size = int(self.config.reference_batch_size)
         reference_generation_seconds = 0.0
         reference_features_seconds = 0.0
+        reference_cache_load_seconds = 0.0
         candidate_features_seconds = 0.0
         reference_selection_seconds = 0.0
         selected_reference_count = references_per_prompt
@@ -1278,6 +1395,67 @@ class IEMReward:
                         )
                         else None
                     )
+                    cache_key = (
+                        CLIP_KEY
+                        if self.distance_metric.startswith("clip_")
+                        else DINO_KEY
+                    )
+                    stage_start = synchronized_time(self.accelerator.device)
+                    cached = self._cached_references(
+                        epoch=epoch,
+                        prompt=prompt,
+                        tensor_keys=(cache_key,),
+                    )
+                    if cached is not None:
+                        reference_features = cached[cache_key].to(
+                            self.accelerator.device
+                        ).float()
+                        if self.distance_metric not in L2_DISTANCE_METRICS:
+                            reference_features = F.normalize(
+                                reference_features, p=2, dim=1
+                            )
+                        reference_cache_load_seconds += (
+                            synchronized_time(self.accelerator.device)
+                            - stage_start
+                        )
+                        stage_start = synchronized_time(
+                            self.accelerator.device
+                        )
+                        candidate_features = self._image_embeddings_from_latents(
+                            candidate_latents[candidate_start:candidate_stop]
+                        )
+                        candidate_features_seconds += (
+                            synchronized_time(self.accelerator.device)
+                            - stage_start
+                        )
+                        if self.distance_metric in L2_DISTANCE_METRICS:
+                            if self.reference_selection_mode == "nearest":
+                                group_scores, selected_reference_count = (
+                                    mean_nearest_l2_distance(
+                                        candidate_features,
+                                        reference_features,
+                                        self.nearest_reference_fraction,
+                                    )
+                                )
+                            else:
+                                group_scores = mean_pairwise_l2_distance(
+                                    candidate_features, reference_features
+                                )
+                        elif self.reference_selection_mode == "nearest":
+                            group_scores, selected_reference_count = (
+                                mean_nearest_cosine_distance(
+                                    candidate_features,
+                                    reference_features,
+                                    self.nearest_reference_fraction,
+                                )
+                            )
+                        else:
+                            group_scores = cosine_distance_from_reference_mean(
+                                candidate_features,
+                                reference_features.mean(dim=0),
+                            )
+                        scores[candidate_start:candidate_stop] = group_scores
+                        continue
                     reference_seeds = [
                         same_prompt_reference_seed(
                             self.config.seed,
@@ -1444,10 +1622,18 @@ class IEMReward:
             f"{prefix}_reference_subset_size": float(references_per_prompt),
             f"{prefix}_same_prompt_reference_groups": float(global_group_count),
             f"{prefix}_same_prompt_references_generated": float(
+                0 if self.reference_cache is not None
+                else global_group_count * references_per_prompt
+            ),
+            f"{prefix}_same_prompt_references_loaded": float(
                 global_group_count * references_per_prompt
+                if self.reference_cache is not None else 0
             ),
             f"timing/{prefix}_reference_refresh_seconds": (
                 reference_generation_seconds
+            ),
+            f"timing/{prefix}_reference_cache_load_seconds": (
+                reference_cache_load_seconds
             ),
             f"timing/{prefix}_reference_features_seconds": (
                 reference_features_seconds
@@ -1512,6 +1698,7 @@ class IEMReward:
         )
         host = self._adapter_host(self.model)
         reference_generation_seconds = 0.0
+        reference_cache_load_seconds = 0.0
         reference_statistics_seconds = 0.0
         candidate_features_seconds = 0.0
         references_per_prompt = int(self.config.reference_samples_per_prompt)
@@ -1551,6 +1738,15 @@ class IEMReward:
                     reference_count = 0
                     sum_phi = None
                     sum_phi_squared_norm = None
+                    stage_start = synchronized_time(self.accelerator.device)
+                    cached = self._cached_references(
+                        epoch=epoch,
+                        prompt=prompt,
+                        tensor_keys=(LATENT_KEY,),
+                    )
+                    reference_cache_load_seconds += (
+                        synchronized_time(self.accelerator.device) - stage_start
+                    ) if cached is not None else 0.0
                     reference_seeds = [
                         same_prompt_reference_seed(
                             self.config.seed,
@@ -1598,28 +1794,37 @@ class IEMReward:
                         stage_start = synchronized_time(
                             self.accelerator.device
                         )
-                        with self.accelerator.autocast():
-                            reference_latents = self._reference_pipe(
-                                prompt_embeds=reference_prompt_embeds,
-                                pooled_prompt_embeds=(
-                                    reference_pooled_prompt_embeds
-                                ),
-                                height=int(self.config.resolution),
-                                width=int(self.config.resolution),
-                                num_inference_steps=int(
-                                    self.config.num_inference_steps
-                                ),
-                                guidance_scale=float(
-                                    self.config.guidance_scale
-                                ),
-                                generator=generators,
-                                output_type="latent",
-                                return_dict=False,
-                            )[0]
-                        reference_generation_seconds += (
-                            synchronized_time(self.accelerator.device)
-                            - stage_start
-                        )
+                        if cached is not None:
+                            reference_latents = cached[LATENT_KEY][
+                                reference_start:reference_stop
+                            ].to(self.accelerator.device)
+                            reference_cache_load_seconds += (
+                                synchronized_time(self.accelerator.device)
+                                - stage_start
+                            )
+                        else:
+                            with self.accelerator.autocast():
+                                reference_latents = self._reference_pipe(
+                                    prompt_embeds=reference_prompt_embeds,
+                                    pooled_prompt_embeds=(
+                                        reference_pooled_prompt_embeds
+                                    ),
+                                    height=int(self.config.resolution),
+                                    width=int(self.config.resolution),
+                                    num_inference_steps=int(
+                                        self.config.num_inference_steps
+                                    ),
+                                    guidance_scale=float(
+                                        self.config.guidance_scale
+                                    ),
+                                    generator=generators,
+                                    output_type="latent",
+                                    return_dict=False,
+                                )[0]
+                            reference_generation_seconds += (
+                                synchronized_time(self.accelerator.device)
+                                - stage_start
+                            )
 
                         stage_start = synchronized_time(
                             self.accelerator.device
@@ -1745,10 +1950,18 @@ class IEMReward:
             ),
             "iem_same_prompt_reference_groups": float(global_group_count),
             "iem_same_prompt_references_generated": float(
+                0 if self.reference_cache is not None
+                else global_group_count * references_per_prompt
+            ),
+            "iem_same_prompt_references_loaded": float(
                 global_group_count * references_per_prompt
+                if self.reference_cache is not None else 0
             ),
             "timing/iem_reference_refresh_seconds": (
                 reference_generation_seconds
+            ),
+            "timing/iem_reference_cache_load_seconds": (
+                reference_cache_load_seconds
             ),
             "timing/iem_reference_statistics_seconds": (
                 reference_statistics_seconds

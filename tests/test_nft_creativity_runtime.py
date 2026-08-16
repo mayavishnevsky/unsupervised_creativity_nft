@@ -8,8 +8,10 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 
 from config.nft import (
     sd3_iem_same_prompt_partiprompts,
+    sd3_iem_same_prompt_partiprompts_ram_aligned,
     sd3_iem_same_prompt_partiprompts_smoke,
 )
+from flow_grpo.creativity import BalancedPromptSampler
 from flow_grpo.nft_creativity_runtime import (
     DistributedPromptGroupBatchSampler,
     fixed_validation_seed,
@@ -81,6 +83,34 @@ class PromptGroupSamplerTests(unittest.TestCase):
         self.assertEqual(epoch_zero, list(sampler))
 
 
+
+    def test_ram_aligned_draw_matches_balanced_prompt_sampler(self):
+        prompts = [f"prompt-{index}" for index in range(20)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "train.txt"
+            path.write_text("\n".join(prompts) + "\n")
+            expected = [
+                record.prompt_id
+                for record in BalancedPromptSampler([path]).sample(8, seed=17)
+            ]
+
+        rank_groups = []
+        for rank in range(2):
+            sampler = DistributedPromptGroupBatchSampler(
+                SizedDataset(len(prompts)),
+                batch_size=2,
+                group_size=2,
+                num_groups=8,
+                num_replicas=2,
+                rank=rank,
+                seed=17,
+                ram_aligned=True,
+            )
+            rank_groups.append([batch[0] for batch in sampler])
+        self.assertEqual(rank_groups[0], expected[0::2])
+        self.assertEqual(rank_groups[1], expected[1::2])
+
+
 class ConfigAndSeedTests(unittest.TestCase):
     def test_full_config_matches_requested_run(self):
         config = sd3_iem_same_prompt_partiprompts()
@@ -115,6 +145,16 @@ class ConfigAndSeedTests(unittest.TestCase):
             0,
         )
         self.assertEqual(len(sampler), 1)
+
+    def test_ram_aligned_config_uses_shared_reference_identity(self):
+        config = sd3_iem_same_prompt_partiprompts_ram_aligned()
+        self.assertTrue(config.sample.ram_aligned_prompt_sampling)
+        self.assertEqual(config.validation.prompt_seed, 3_000_009)
+        self.assertEqual(config.creativity.num_inference_steps, 20)
+        self.assertEqual(
+            config.creativity.reference_cache_spec_sha256,
+            "8e1740457eda50906764d89e9b42de97202d68cb34a9daf20522057f2524464b",
+        )
 
     def test_validation_seed_is_stable_and_prompt_specific(self):
         self.assertEqual(

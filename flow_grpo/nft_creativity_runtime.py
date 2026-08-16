@@ -32,6 +32,7 @@ class DistributedPromptGroupBatchSampler(Sampler[list[int]]):
         num_replicas: int,
         rank: int,
         seed: int = 0,
+        ram_aligned: bool = False,
     ):
         self.dataset = dataset
         self.batch_size = int(batch_size)
@@ -40,6 +41,7 @@ class DistributedPromptGroupBatchSampler(Sampler[list[int]]):
         self.num_replicas = int(num_replicas)
         self.rank = int(rank)
         self.seed = int(seed)
+        self.ram_aligned = bool(ram_aligned)
         self.epoch = 0
 
         if self.num_groups > len(dataset):
@@ -57,10 +59,17 @@ class DistributedPromptGroupBatchSampler(Sampler[list[int]]):
         return groups_per_rank * batches_per_group
 
     def __iter__(self):
-        generator = torch.Generator().manual_seed(self.seed + self.epoch)
-        group_indices = torch.randperm(len(self.dataset), generator=generator)[
-            : self.num_groups
-        ].tolist()
+        if self.ram_aligned:
+            generator = random.Random(self.seed + self.epoch)
+            group_indices = generator.sample(
+                range(len(self.dataset)), self.num_groups
+            )
+            generator.shuffle(group_indices)
+        else:
+            generator = torch.Generator().manual_seed(self.seed + self.epoch)
+            group_indices = torch.randperm(
+                len(self.dataset), generator=generator
+            )[: self.num_groups].tolist()
         local_indices = group_indices[self.rank :: self.num_replicas]
         batches_per_group = self.group_size // self.batch_size
         for prompt_index in local_indices:

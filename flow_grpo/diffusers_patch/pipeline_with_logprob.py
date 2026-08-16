@@ -253,6 +253,12 @@ def pipeline_with_logprob(
     # 7. Denoising loop
     latents, all_latents, all_log_probs = run_sampling(v_pred_fn, latents, sigmas, solver, deterministic, noise_level)
 
+    if output_type == "latent":
+        self.maybe_free_model_hooks()
+        if not flux:
+            return latents, all_latents, all_log_probs
+        return latents, all_latents, latent_image_ids, text_ids, all_log_probs
+
     if flux:
         latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
     latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor

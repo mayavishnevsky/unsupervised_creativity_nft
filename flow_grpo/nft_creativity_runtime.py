@@ -8,6 +8,7 @@ import json
 import os
 import random
 import shutil
+import stat
 import uuid
 from pathlib import Path
 
@@ -169,6 +170,12 @@ def _restore_rng_state(state: dict) -> None:
         torch.cuda.set_rng_state_all([rng_state.cpu() for rng_state in state["cuda"]])
 
 
+def _ensure_owner_writable_directory(path: Path) -> None:
+    """Restore owner access if an external permission sweep made a run read-only."""
+
+    path.chmod(path.stat().st_mode | stat.S_IRWXU)
+
+
 def save_training_checkpoint(
     save_dir,
     model,
@@ -194,8 +201,12 @@ def save_training_checkpoint(
 
     checkpoint_path = None
     if rank == 0:
-        root = Path(save_dir) / "checkpoints"
+        save_root = Path(save_dir)
+        save_root.mkdir(parents=True, exist_ok=True)
+        _ensure_owner_writable_directory(save_root)
+        root = save_root / "checkpoints"
         root.mkdir(parents=True, exist_ok=True)
+        _ensure_owner_writable_directory(root)
         checkpoint_path = root / f"checkpoint-epoch-{int(next_epoch):04d}"
         if checkpoint_path.exists() and (checkpoint_path / "_SUCCESS").is_file():
             raise FileExistsError(f"completed checkpoint already exists: {checkpoint_path}")

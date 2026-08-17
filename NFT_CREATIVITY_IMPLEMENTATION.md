@@ -172,14 +172,23 @@ candidate sampler intact:
   seed `config.seed + epoch`, order, and distributed striding as RAM.
 - Validation prompt selection uses seed `3_000_009`; validation latent seeds
   continue to use RAM's prompt-specific hash with base seed 0.
-- IEM, CLIP, and DINO references are loaded from RAM's immutable cache. IEM
-  consumes the exact BF16 endpoint latents, while CLIP/DINO consume the exact
+- IEM, CLIP, and DINO references are loaded from RAM's immutable cache.
+  All-reference IEM consumes exact FP32 `mu_omega` and FP64 `v_omega`
+  statistics, avoiding reference denoiser probes; BF16 endpoints remain stored
+  for frameworks that need individual references. CLIP/DINO consume the exact
   FP32 raw embeddings saved beside them.
 
 The reader requires the cache `_SUCCESS` marker and validates its specification
 hash, prompt-file digest, seed, resolution, reference count, baseline inference
-steps, guidance scale, and encoder model IDs. It never silently falls back to
-NFT generation when an aligned cache entry is absent or incompatible.
+steps, guidance scale, encoder model IDs, sigma bounds, integration-level count,
+noise-table count, process count, feature weighting, and noise assignment. It
+also requires each runtime candidate noise table's seed and SHA-256 digest to
+match the values stored beside its statistics. If a completed cache lacks an
+`(epoch, prompt)` pair, NFT uses its ordinary deterministic reference-generation
+path and computes the required embeddings or IEM statistics at runtime. This
+allows a longer NFT run to use a shorter RAM cache as a prefix. Incompatible
+specifications, malformed present entries, and IEM noise identity mismatches
+remain hard errors rather than falling back.
 
 This aligns reference endpoints, not NFT candidate endpoints. RAM uses a
 20-step Euler rollout and NFT uses a 25-step DPM2 rollout, so their final

@@ -47,6 +47,10 @@ class ReferenceCacheTests(unittest.TestCase):
                 clip_embeddings=clip,
                 dino_embeddings=dino,
                 seeds=[11, 12, 13],
+                iem_mean=torch.zeros(8),
+                iem_variance=0.0,
+                iem_noise_seed=123,
+                iem_noise_sha256="ab" * 32,
             )
 
             self.assertTrue(
@@ -62,6 +66,8 @@ class ReferenceCacheTests(unittest.TestCase):
                 cache_dir,
                 expected_spec_sha256=spec_sha256,
             )
+            self.assertTrue(reader.has_entry(epoch=4, prompt="a black cat"))
+            self.assertFalse(reader.has_entry(epoch=5, prompt="a black cat"))
             loaded = reader.load(
                 epoch=4,
                 prompt="a black cat",

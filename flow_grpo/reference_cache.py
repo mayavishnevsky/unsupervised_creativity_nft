@@ -1,8 +1,9 @@
 """Persistent same-prompt reference data for creativity rewards.
 
-Each cache entry contains the frozen baseline's endpoint latents and raw image
-embeddings for one ``(epoch, prompt)`` pair. Files are published atomically so
-an interrupted precompute job can safely resume without trusting partial data.
+Each cache entry contains the frozen baseline's endpoint latents, raw image
+embeddings, and all-reference IEM sufficient statistics for one
+``(epoch, prompt)`` pair. Files are published atomically so an interrupted
+precompute job can safely resume without trusting partial data.
 """
 
 from __future__ import annotations
@@ -18,14 +19,22 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 CACHE_SPEC_FILENAME = "spec.json"
 CACHE_SUCCESS_FILENAME = "_SUCCESS"
 LATENT_KEY = "latents"
 CLIP_KEY = "clip_embeddings"
 DINO_KEY = "dino_embeddings"
 SEED_KEY = "seeds"
-REQUIRED_TENSOR_KEYS = (LATENT_KEY, CLIP_KEY, DINO_KEY, SEED_KEY)
+IEM_MEAN_KEY = "iem_mean"
+IEM_VARIANCE_KEY = "iem_variance"
+IEM_NOISE_SEED_KEY = "iem_noise_seed"
+IEM_NOISE_SHA256_KEY = "iem_noise_sha256"
+PER_REFERENCE_TENSOR_KEYS = (LATENT_KEY, CLIP_KEY, DINO_KEY, SEED_KEY)
+IEM_TENSOR_KEYS = (
+    IEM_MEAN_KEY, IEM_VARIANCE_KEY, IEM_NOISE_SEED_KEY, IEM_NOISE_SHA256_KEY
+)
+REQUIRED_TENSOR_KEYS = PER_REFERENCE_TENSOR_KEYS + IEM_TENSOR_KEYS
 
 
 def canonical_json(value: object) -> str:
@@ -177,9 +186,17 @@ def validate_cache_entry(
             keys = set(handle.keys())
             if keys != set(REQUIRED_TENSOR_KEYS):
                 return False
-            for key in REQUIRED_TENSOR_KEYS:
+            for key in PER_REFERENCE_TENSOR_KEYS:
                 if handle.get_slice(key).get_shape()[0] != int(reference_count):
                     return False
+            if len(handle.get_slice(IEM_MEAN_KEY).get_shape()) != 1:
+                return False
+            if handle.get_slice(IEM_VARIANCE_KEY).get_shape() != [1]:
+                return False
+            if handle.get_slice(IEM_NOISE_SEED_KEY).get_shape() != [1]:
+                return False
+            if handle.get_slice(IEM_NOISE_SHA256_KEY).get_shape() != [32]:
+                return False
     except (OSError, RuntimeError, ValueError):
         return False
     return True
@@ -196,6 +213,10 @@ def write_cache_entry(
     clip_embeddings: torch.Tensor,
     dino_embeddings: torch.Tensor,
     seeds: Sequence[int] | torch.Tensor,
+    iem_mean: torch.Tensor,
+    iem_variance: torch.Tensor | float,
+    iem_noise_seed: int,
+    iem_noise_sha256: str,
 ) -> Path:
     """Atomically publish one reference cloud in its storage dtypes."""
 
@@ -207,6 +228,20 @@ def write_cache_entry(
         torch.as_tensor(dino_embeddings).detach().cpu().float().contiguous()
     )
     seeds = torch.as_tensor(seeds, dtype=torch.int64, device="cpu").contiguous()
+    iem_mean = torch.as_tensor(iem_mean).detach().cpu().float().contiguous()
+    iem_variance = (
+        torch.as_tensor(iem_variance, dtype=torch.float64, device="cpu")
+        .reshape(1)
+        .contiguous()
+    )
+    iem_noise_seed = torch.tensor(
+        [int(iem_noise_seed)], dtype=torch.int64, device="cpu"
+    )
+    try:
+        noise_digest = bytes.fromhex(str(iem_noise_sha256))
+    except ValueError as exc:
+        raise ValueError("IEM noise SHA-256 must be hexadecimal") from exc
+    iem_noise_sha256 = torch.tensor(list(noise_digest), dtype=torch.uint8)
     reference_count = latents.shape[0]
     if reference_count < 1:
         raise ValueError("a reference cache entry must be nonempty")
@@ -217,6 +252,14 @@ def write_cache_entry(
         raise ValueError("cached latents, embeddings, and seeds must be aligned")
     if clip_embeddings.ndim != 2 or dino_embeddings.ndim != 2:
         raise ValueError("cached CLIP and DINO embeddings must be matrices")
+    if iem_mean.ndim != 1 or iem_mean.numel() < 1:
+        raise ValueError("cached IEM mean must be a nonempty vector")
+    if not torch.isfinite(iem_mean).all():
+        raise ValueError("cached IEM mean must be finite")
+    if not torch.isfinite(iem_variance).all() or (iem_variance < 0).any():
+        raise ValueError("cached IEM variance must be finite and non-negative")
+    if iem_noise_sha256.numel() != 32:
+        raise ValueError("IEM noise SHA-256 must contain exactly 32 bytes")
 
     path = entry_path(cache_dir, epoch, prompt)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -227,6 +270,10 @@ def write_cache_entry(
             CLIP_KEY: clip_embeddings,
             DINO_KEY: dino_embeddings,
             SEED_KEY: seeds,
+            IEM_MEAN_KEY: iem_mean,
+            IEM_VARIANCE_KEY: iem_variance,
+            IEM_NOISE_SEED_KEY: iem_noise_seed,
+            IEM_NOISE_SHA256_KEY: iem_noise_sha256,
         },
         temporary,
         metadata=_entry_metadata(
@@ -268,6 +315,11 @@ class ReferenceCacheReader:
             self.cache_dir / CACHE_SUCCESS_FILENAME
         ).is_file():
             raise ValueError(f"reference cache is not complete: {self.cache_dir}")
+
+    def has_entry(self, *, epoch: int, prompt: str) -> bool:
+        """Return whether this cache contains the requested epoch/prompt pair."""
+
+        return entry_path(self.cache_dir, epoch, prompt).is_file()
 
     def load(
         self,

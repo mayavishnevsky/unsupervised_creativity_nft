@@ -26,6 +26,10 @@ import torch.nn.functional as F
 from flow_grpo.reference_cache import (
     CLIP_KEY,
     DINO_KEY,
+    IEM_MEAN_KEY,
+    IEM_NOISE_SEED_KEY,
+    IEM_NOISE_SHA256_KEY,
+    IEM_VARIANCE_KEY,
     LATENT_KEY,
     ReferenceCacheReader,
 )
@@ -40,6 +44,10 @@ IMAGE_DISTANCE_MODEL_FIELDS = {
     "dino_l2": "dino_model_id",
     "tpips_overall": "tpips_model_id",
 }
+IEM_FEATURE_WEIGHTING = "sqrt_delta_gamma_div_num_steps_v1"
+IEM_NOISE_ASSIGNMENT = "rank_permutation_v1"
+IEM_ASSIGNMENT_SEED_OFFSET = 60_000_000
+IEM_NOISE_SEED_OFFSET = 90_000_000
 SUPPORTED_DISTANCE_METRICS = ("iem", *IMAGE_DISTANCE_MODEL_FIELDS)
 L2_DISTANCE_METRICS = frozenset(("clip_l2", "dino_l2"))
 
@@ -256,6 +264,26 @@ def sample_iem_noise_table(
     )
 
 
+def iem_noise_table_seed(seed: int, epoch: int, table_count: int, table_index: int) -> int:
+    """Return the deterministic seed for one epoch's IEM noise table."""
+    table_count = int(table_count)
+    table_index = int(table_index)
+    if table_count < 1 or not 0 <= table_index < table_count:
+        raise ValueError("IEM noise table index is outside the configured range")
+    return (
+        int(seed)
+        + IEM_NOISE_SEED_OFFSET
+        + int(epoch) * table_count
+        + table_index
+    )
+
+
+def iem_noise_sha256(noise_table: Tensor) -> str:
+    """Hash the exact FP32 IEM noise values used by candidates and references."""
+    noise = torch.as_tensor(noise_table).detach().to("cpu", torch.float32).contiguous()
+    return hashlib.sha256(noise.numpy().tobytes(order="C")).hexdigest()
+
+
 def repeat_endpoint_conditions(
     prompt_embeds: Tensor,
     pooled_prompt_embeds: Tensor,
@@ -374,6 +402,22 @@ def update_reference_sums(
         sum_phi + batch_sum_phi,
         sum_phi_squared_norm + batch_sum_phi_squared_norm,
     )
+
+
+def finalize_reference_statistics(
+    count: int, sum_phi: Tensor, sum_phi_squared_norm: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Return equation-21 ``mu_omega`` and ``v_omega`` from accumulated sums."""
+    count = int(count)
+    if count < 1:
+        raise ValueError("reference statistics require a positive count")
+    sum_phi = torch.as_tensor(sum_phi, dtype=torch.float64)
+    sum_phi_squared_norm = torch.as_tensor(sum_phi_squared_norm, dtype=torch.float64)
+    if sum_phi.ndim != 1 or sum_phi_squared_norm.numel() != 1:
+        raise ValueError("reference sums have incompatible shapes")
+    mu_omega_64 = sum_phi / count
+    v_omega = (sum_phi_squared_norm / count - mu_omega_64.square().sum()).clamp_min(0)
+    return mu_omega_64.float(), v_omega
 
 
 def iem_reward_from_reference_statistics(
@@ -832,6 +876,27 @@ class IEMReward:
                     cached.get("model_id") if isinstance(cached, dict) else None,
                     model_id,
                 )
+        if self.distance_metric == "iem":
+            cached_iem = spec.get("iem")
+            expected_iem = {
+                "sigma_min": float(self.config.sigma_min),
+                "sigma_max": float(self.config.sigma_max),
+                "num_steps": int(self.config.num_steps),
+                "noise_table_count": int(self.config.noise_table_count),
+                "world_size": int(self.accelerator.num_processes),
+                "feature_weighting": IEM_FEATURE_WEIGHTING,
+                "noise_assignment": IEM_NOISE_ASSIGNMENT,
+            }
+            if not isinstance(cached_iem, dict):
+                mismatches["iem"] = (cached_iem, expected_iem)
+            else:
+                for name, value in expected_iem.items():
+                    if cached_iem.get(name) != value:
+                        mismatches[f"iem.{name}"] = (
+                            cached_iem.get(name),
+                            value,
+                        )
+
         if mismatches:
             raise ValueError(
                 "RAM reference cache is incompatible with NFT creativity "
@@ -847,6 +912,8 @@ class IEMReward:
     ) -> dict[str, Tensor] | None:
         if self.reference_cache is None:
             return None
+        if not self.reference_cache.has_entry(epoch=epoch, prompt=prompt):
+            return None
         tensors = self.reference_cache.load(
             epoch=epoch,
             prompt=prompt,
@@ -859,6 +926,48 @@ class IEMReward:
                 "reference_samples_per_prompt"
             )
         return tensors
+
+    def _cached_iem_statistics(
+        self,
+        *,
+        epoch: int,
+        prompt: str,
+        noise_seed: int,
+        noise_sha256: str,
+        feature_dimension: int,
+    ) -> tuple[Tensor, Tensor] | None:
+        """Load statistics only when they match the candidate's exact noise."""
+        if self.reference_cache is None or self.reference_selection_mode != "all":
+            return None
+        if not self.reference_cache.has_entry(epoch=epoch, prompt=prompt):
+            return None
+        tensors = self.reference_cache.load(
+            epoch=epoch,
+            prompt=prompt,
+            tensor_keys=(
+                IEM_MEAN_KEY,
+                IEM_VARIANCE_KEY,
+                IEM_NOISE_SEED_KEY,
+                IEM_NOISE_SHA256_KEY,
+            ),
+        )
+        saved_seed = int(tensors[IEM_NOISE_SEED_KEY].item())
+        if saved_seed != int(noise_seed):
+            raise ValueError("cached IEM noise seed does not match candidate noise")
+        saved_sha256 = bytes(tensors[IEM_NOISE_SHA256_KEY].tolist()).hex()
+        if saved_sha256 != str(noise_sha256):
+            raise ValueError("cached IEM noise hash does not match candidate noise")
+        mean = tensors[IEM_MEAN_KEY]
+        variance = tensors[IEM_VARIANCE_KEY]
+        if mean.ndim != 1 or mean.numel() != int(feature_dimension):
+            raise ValueError("cached IEM mean has the wrong feature dimension")
+        if variance.numel() != 1 or not torch.isfinite(variance).all():
+            raise ValueError("cached IEM variance is not a finite scalar")
+        return (
+            mean.to(self.accelerator.device, dtype=torch.float32),
+            variance.to(self.accelerator.device, dtype=torch.float64),
+        )
+
 
     @staticmethod
     def _adapter_host(model):
@@ -1659,6 +1768,40 @@ class IEMReward:
         return scores, metrics
 
     @torch.no_grad()
+    def _iem_scores_from_statistics(
+        self,
+        latents: Tensor,
+        prompt_embeds: Tensor,
+        pooled_prompt_embeds: Tensor,
+        noise_table: Tensor,
+        mu_omega: Tensor,
+        v_omega: Tensor,
+    ) -> Tensor:
+        scores = []
+        batch_size = int(self.config.feature_batch_size)
+        for start in range(0, len(latents), batch_size):
+            stop = min(start + batch_size, len(latents))
+            features = iem_features(
+                latents[start:stop],
+                self._velocity_prediction(
+                    prompt_embeds[start:stop],
+                    pooled_prompt_embeds[start:stop],
+                ),
+                self.sigma_schedule,
+                noise_table,
+                level_batch_size=int(self.config.level_batch_size),
+            )
+            scores.append(
+                iem_reward_from_reference_statistics(
+                    features,
+                    mu_omega,
+                    v_omega,
+                )
+            )
+        return torch.cat(scores)
+
+
+    @torch.no_grad()
     def _score_same_prompt(
         self,
         candidate_latents: Tensor,
@@ -1708,18 +1851,20 @@ class IEMReward:
 
         with host.disable_adapter():
             for table_index in group_assignments.unique().tolist():
+                noise_seed = iem_noise_table_seed(
+                    self.config.seed,
+                    epoch,
+                    self.config.noise_table_count,
+                    table_index,
+                )
                 noise_table = sample_iem_noise_table(
                     self.sigma_schedule,
                     signal_shape,
                     device=self.accelerator.device,
                     dtype=torch.float32,
-                    seed=(
-                        int(self.config.seed)
-                        + 90_000_000
-                        + int(epoch) * int(self.config.noise_table_count)
-                        + int(table_index)
-                    ),
+                    seed=noise_seed,
                 )
+                noise_sha256 = iem_noise_sha256(noise_table)
                 table_group_indices = torch.nonzero(
                     group_assignments == table_index,
                     as_tuple=False,
@@ -1734,6 +1879,41 @@ class IEMReward:
                     pooled_prompt_embed = candidate_pooled_prompt_embeds[
                         candidate_start : candidate_start + 1
                     ]
+
+                    stage_start = synchronized_time(self.accelerator.device)
+                    cached_statistics = self._cached_iem_statistics(
+                        epoch=epoch,
+                        prompt=prompt,
+                        noise_seed=noise_seed,
+                        noise_sha256=noise_sha256,
+                        feature_dimension=int(self.config.num_steps) * math.prod(signal_shape),
+                    )
+                    if cached_statistics is not None:
+                        reference_cache_load_seconds += (
+                            synchronized_time(self.accelerator.device) - stage_start
+                        )
+                        mu_omega, v_omega = cached_statistics
+                        stage_start = synchronized_time(self.accelerator.device)
+                        scores[candidate_start:candidate_stop] = (
+                            self._iem_scores_from_statistics(
+                                candidate_latents[
+                                    candidate_start:candidate_stop
+                                ],
+                                candidate_prompt_embeds[
+                                    candidate_start:candidate_stop
+                                ],
+                                candidate_pooled_prompt_embeds[
+                                    candidate_start:candidate_stop
+                                ],
+                                noise_table,
+                                mu_omega,
+                                v_omega,
+                            )
+                        )
+                        candidate_features_seconds += (
+                            synchronized_time(self.accelerator.device) - stage_start
+                        )
+                        continue
 
                     reference_count = 0
                     sum_phi = None
@@ -1876,12 +2056,11 @@ class IEMReward:
                             "same-prompt reference generation returned "
                             "an unexpected number of endpoints"
                         )
-                    mu_omega_64 = sum_phi / reference_count
-                    v_omega = (
-                        sum_phi_squared_norm / reference_count
-                        - mu_omega_64.square().sum()
-                    ).clamp_min(0)
-                    mu_omega = mu_omega_64.float()
+                    mu_omega, v_omega = finalize_reference_statistics(
+                        reference_count,
+                        sum_phi,
+                        sum_phi_squared_norm,
+                    )
 
                     stage_start = synchronized_time(self.accelerator.device)
                     for candidate_batch_start in range(

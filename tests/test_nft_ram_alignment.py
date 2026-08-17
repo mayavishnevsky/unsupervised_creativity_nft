@@ -81,6 +81,15 @@ class NftRamReferenceAlignmentTests(unittest.TestCase):
                 ).source_sha256,
                 "clip": {"model_id": "openai/clip-vit-large-patch14"},
                 "dino": {"model_id": "facebook/dinov2-base"},
+                "iem": {
+                    "sigma_min": 0.009,
+                    "sigma_max": 1000.0,
+                    "num_steps": 2,
+                    "noise_table_count": 1,
+                    "world_size": 1,
+                    "feature_weighting": "sqrt_delta_gamma_div_num_steps_v1",
+                    "noise_assignment": "rank_permutation_v1",
+                },
             }
             spec_sha256 = write_cache_spec(root, spec)
             (root / CACHE_SUCCESS_FILENAME).write_text(
@@ -100,6 +109,10 @@ class NftRamReferenceAlignmentTests(unittest.TestCase):
                 clip_embeddings=torch.randn(2, 3),
                 dino_embeddings=torch.randn(2, 4),
                 seeds=[11, 12],
+                iem_mean=torch.zeros(4),
+                iem_variance=0.0,
+                iem_noise_seed=123,
+                iem_noise_sha256="ab" * 32,
             )
 
             reward = IEMReward(
@@ -114,6 +127,13 @@ class NftRamReferenceAlignmentTests(unittest.TestCase):
                 tensor_keys=(LATENT_KEY,),
             )
             torch.testing.assert_close(cached[LATENT_KEY], latents)
+            self.assertIsNone(
+                reward._cached_references(
+                    epoch=20,
+                    prompt=prompt,
+                    tensor_keys=(LATENT_KEY,),
+                )
+            )
 
             incompatible = creativity_config(prompt_file, root, spec_sha256)
             incompatible.num_inference_steps = 25
@@ -154,6 +174,10 @@ class NftRamReferenceAlignmentTests(unittest.TestCase):
                 epoch=0,
                 prompt=prompt,
                 prompt_id=0,
+                iem_mean=torch.zeros(2),
+                iem_variance=0.0,
+                iem_noise_seed=123,
+                iem_noise_sha256="ab" * 32,
                 latents=torch.zeros(2, 1, 1, 1),
                 clip_embeddings=reference_features,
                 dino_embeddings=torch.zeros(2, 3),

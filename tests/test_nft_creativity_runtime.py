@@ -153,7 +153,7 @@ class ConfigAndSeedTests(unittest.TestCase):
         self.assertEqual(config.creativity.num_inference_steps, 20)
         self.assertEqual(
             config.creativity.reference_cache_spec_sha256,
-            "8e1740457eda50906764d89e9b42de97202d68cb34a9daf20522057f2524464b",
+            "d2ac2f59a948f67532f6f9dfa100992ae08fe6683bbc59768f2cccc38f566570",
         )
 
     def test_validation_seed_is_stable_and_prompt_specific(self):
@@ -222,6 +222,55 @@ class CheckpointTests(unittest.TestCase):
                 torch.testing.assert_close(value, torch.ones_like(value))
             for value in get_peft_model_state_dict(model, adapter_name="old").values():
                 torch.testing.assert_close(value, torch.full_like(value, 2.0))
+
+    def test_save_repairs_owner_write_permission(self):
+        base = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
+        lora_config = LoraConfig(r=2, lora_alpha=2, target_modules=["0"])
+        model = get_peft_model(base, lora_config)
+        model.add_adapter("old", lora_config)
+        model.set_adapter("default")
+        optimizer = torch.optim.AdamW(
+            [parameter for parameter in model.parameters() if parameter.requires_grad],
+            lr=1e-3,
+        )
+        creativity = FakeCreativityRewards()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_training_checkpoint(
+                tmpdir,
+                model,
+                optimizer,
+                None,
+                None,
+                creativity,
+                FakeConfig(),
+                next_epoch=1,
+                global_step=1,
+                rank=0,
+                world_size=1,
+            )
+            save_root = Path(tmpdir)
+            checkpoint_root = save_root / "checkpoints"
+            save_root.chmod(0o2570)
+            checkpoint_root.chmod(0o2570)
+
+            checkpoint = save_training_checkpoint(
+                tmpdir,
+                model,
+                optimizer,
+                None,
+                None,
+                creativity,
+                FakeConfig(),
+                next_epoch=2,
+                global_step=2,
+                rank=0,
+                world_size=1,
+            )
+
+            self.assertTrue((checkpoint / "_SUCCESS").is_file())
+            self.assertTrue(save_root.stat().st_mode & 0o200)
+            self.assertTrue(checkpoint_root.stat().st_mode & 0o200)
 
 
 if __name__ == "__main__":

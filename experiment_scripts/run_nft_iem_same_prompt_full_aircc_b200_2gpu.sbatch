@@ -29,7 +29,8 @@ TRAIN_BETA="${TRAIN_BETA:-0.01}"
 REFERENCE_PROMPT_MODE="${REFERENCE_PROMPT_MODE:-same_prompt}"
 CONFIG_NAME="${CONFIG_NAME:-sd3_iem_same_prompt_partiprompts}"
 RUN_LABEL="${RUN_LABEL:-nft_iem_same_prompt_full}"
-RUN_DIR="$ROOT/runs/${RUN_LABEL}_${SLURM_JOB_ID}"
+RUN_DIR="${RUN_DIR_OVERRIDE:-$ROOT/runs/${RUN_LABEL}_${SLURM_JOB_ID}}"
+RUN_NAME="${RUN_NAME_OVERRIDE:-${RUN_LABEL}_${SLURM_JOB_ID}}"
 NUM_GPUS=2
 MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
 
@@ -111,7 +112,7 @@ cd "$REPO"
   --config.creativity.reference_prompt_mode="$REFERENCE_PROMPT_MODE" \
   --config.train.beta="$TRAIN_BETA" \
   --config.save_dir="$RUN_DIR" \
-  --config.run_name="${RUN_LABEL}_${SLURM_JOB_ID}" \
+  --config.run_name="$RUN_NAME" \
   --config.wandb_project=unsupervised_creativity_nft \
   --config.wandb_entity=mayavishnevsky-tel-aviv-university \
   "${RESUME_ARGS[@]}"

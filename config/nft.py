@@ -209,6 +209,7 @@ def sd3_iem_same_prompt_partiprompts():
     config.creativity = creativity = ml_collections.ConfigDict()
     creativity.enabled = True
     creativity.distance_metric = "iem"
+    creativity.iem_objective = "expected_squared_distance"
     creativity.distance_metrics = ["iem"]
     creativity.reward_weights = ml_collections.ConfigDict({"iem": 1.0})
     creativity.sigma_min = 0.009

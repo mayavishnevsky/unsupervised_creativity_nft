@@ -26,6 +26,7 @@ VENV="$ROOT/envs/nft-b200"
 RAM_ROOT=/shared/home/users/vishnevsky/unsupervised_creativity_ram_aircc
 BASELINE_LORA="$RAM_ROOT/assets/cfg_distilled_sd35m_checkpoint12/lora"
 TRAIN_BETA="${TRAIN_BETA:-0.01}"
+IEM_OBJECTIVE="${IEM_OBJECTIVE:-expected_squared_distance}"
 REFERENCE_PROMPT_MODE="${REFERENCE_PROMPT_MODE:-same_prompt}"
 CONFIG_NAME="${CONFIG_NAME:-sd3_iem_same_prompt_partiprompts}"
 RUN_LABEL="${RUN_LABEL:-nft_iem_same_prompt_full}"
@@ -33,6 +34,13 @@ RUN_DIR="${RUN_DIR_OVERRIDE:-$ROOT/runs/${RUN_LABEL}_${SLURM_JOB_ID}}"
 RUN_NAME="${RUN_NAME_OVERRIDE:-${RUN_LABEL}_${SLURM_JOB_ID}}"
 NUM_GPUS=2
 MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
+case "$IEM_OBJECTIVE" in
+  expected_squared_distance|negative_g) ;;
+  *)
+    echo "IEM_OBJECTIVE must be expected_squared_distance or negative_g" >&2
+    exit 2
+    ;;
+esac
 
 export HOME=/shared/home/users/vishnevsky
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
@@ -71,6 +79,7 @@ echo "Started: $(date -Is)"
 echo "Source: $REPO"
 echo "Run: $RUN_DIR"
 echo "KL regularization coefficient (config.train.beta): $TRAIN_BETA"
+echo "IEM objective: $IEM_OBJECTIVE"
 echo "Creativity reference prompt mode: $REFERENCE_PROMPT_MODE"
 nvidia-smi
 
@@ -110,6 +119,7 @@ cd "$REPO"
   --config "config/nft.py:${CONFIG_NAME}" \
   --config.baseline_lora_path="$BASELINE_LORA" \
   --config.creativity.reference_prompt_mode="$REFERENCE_PROMPT_MODE" \
+  --config.creativity.iem_objective="$IEM_OBJECTIVE" \
   --config.train.beta="$TRAIN_BETA" \
   --config.save_dir="$RUN_DIR" \
   --config.run_name="$RUN_NAME" \

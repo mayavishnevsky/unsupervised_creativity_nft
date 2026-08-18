@@ -13,6 +13,7 @@ from config.nft import (
 )
 from flow_grpo.creativity import BalancedPromptSampler
 from flow_grpo.nft_creativity_runtime import (
+    CreativityRewardSet,
     DistributedPromptGroupBatchSampler,
     fixed_validation_seed,
     load_training_checkpoint,
@@ -121,6 +122,10 @@ class ConfigAndSeedTests(unittest.TestCase):
         self.assertEqual(config.eval_freq, 1)
         self.assertEqual(config.creativity.reference_prompt_mode, "same_prompt")
         self.assertEqual(config.creativity.reference_samples_per_prompt, 256)
+        self.assertEqual(
+            config.creativity.iem_objective,
+            "expected_squared_distance",
+        )
         self.assertEqual(config.creativity.num_steps, 64)
         self.assertEqual(config.creativity.sigma_min, 0.009)
         self.assertEqual(config.creativity.sigma_max, 1000.0)
@@ -165,6 +170,27 @@ class ConfigAndSeedTests(unittest.TestCase):
             fixed_validation_seed(0, "a black cat"),
             fixed_validation_seed(0, "a white cat"),
         )
+
+
+class FixedReward:
+    reward_log_name = "NegativeG"
+
+    def score(self, *args, **kwargs):
+        return torch.tensor([-4.0, -2.0]), {"detail": 5.0}
+
+
+class RewardLoggingTests(unittest.TestCase):
+    def test_reward_set_reports_raw_component_mean(self):
+        reward_set = CreativityRewardSet.__new__(CreativityRewardSet)
+        reward_set.weights = {"iem": 1.0}
+        reward_set.rewards = {"iem": FixedReward()}
+
+        components, metrics = reward_set.score()
+        torch.testing.assert_close(
+            components["avg"], torch.tensor([-4.0, -2.0])
+        )
+        self.assertEqual(metrics["rewards/NegativeG"], -3.0)
+        self.assertEqual(metrics["detail"], 5.0)
 
 
 class CheckpointTests(unittest.TestCase):

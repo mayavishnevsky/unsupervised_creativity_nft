@@ -87,7 +87,7 @@ class NftRamReferenceAlignmentTests(unittest.TestCase):
                     "num_steps": 2,
                     "noise_table_count": 1,
                     "world_size": 1,
-                    "feature_weighting": "sqrt_delta_gamma_div_num_steps_v1",
+                    "feature_weighting": "sqrt_delta_gamma_v1",
                     "noise_assignment": "rank_permutation_v1",
                 },
             }

@@ -26,7 +26,8 @@ TRAIN_RUN_LABEL="${TRAIN_RUN_LABEL:-nft_iem_same_prompt_full}"
 TRAIN_RUN="$ROOT/runs/${TRAIN_RUN_LABEL}_${TRAIN_JOB_ID}"
 CHECKPOINT="$TRAIN_RUN/checkpoints"
 PROMPTS="$EVAL_CODE/creative_probes.txt"
-OUTPUT_DIR="$ROOT/evaluations/${TRAIN_RUN_LABEL}_${TRAIN_JOB_ID}_creative_probes_${SLURM_JOB_ID}"
+EVALUATIONS_DIR="$ROOT/evaluations"
+OUTPUT_DIR="$EVALUATIONS_DIR/${TRAIN_RUN_LABEL}_${TRAIN_JOB_ID}_creative_probes_${SLURM_JOB_ID}"
 VENV="$ROOT/envs/nft-b200"
 RAM_ROOT=/shared/home/users/vishnevsky/unsupervised_creativity_ram_aircc
 BASELINE_LORA="$RAM_ROOT/assets/cfg_distilled_sd35m_checkpoint12/lora"
@@ -48,6 +49,8 @@ export XDG_CACHE_HOME="$TMPDIR/xdg"
 export TRITON_CACHE_DIR="$TMPDIR/triton"
 export CUDA_CACHE_PATH="$TMPDIR/cuda"
 
+mkdir -p "$EVALUATIONS_DIR"
+chmod u+rwx "$EVALUATIONS_DIR"
 for directory in "$OUTPUT_DIR" "$WANDB_DIR" "$WANDB_CACHE_DIR" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH"; do
   mkdir -p "$directory"
   chmod u+rwx "$directory"

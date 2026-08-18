@@ -130,6 +130,9 @@ class CreativityRewardSet:
         for name, reward in self.rewards.items():
             scores, reward_metrics = reward.score(*args, **kwargs)
             component_scores[name] = scores
+            metrics[f"rewards/{reward.reward_log_name}"] = float(
+                scores.detach().double().mean().item()
+            )
             weighted = scores * self.weights[name]
             total = weighted if total is None else total + weighted
             metrics.update(reward_metrics)

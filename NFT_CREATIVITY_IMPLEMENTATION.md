@@ -89,11 +89,12 @@ positive conditioning. The residual is `e_gamma = x_0 - f(x_t,t)`
 (`flow_grpo/creativity.py:273`).
 
 Equation 16 is represented by concatenating the weighted residuals over all
-levels. To remain exactly comparable to the current RAM experiments, the weight
-is `sqrt(delta_gamma / 64)` (`flow_grpo/creativity.py:325`). Thus current runs
-use the interval average convention. Removing `/64` later would multiply all
-squared IEM distances by the constant 64 when the level count stays fixed; that
-change is deliberately not included here.
+levels. The weight is `sqrt(delta_gamma)` (`flow_grpo/creativity.py:361`), so
+the squared feature distance is the finite sum over levels, not an average over
+them. For fixed `num_steps=L`, corrected raw IEM2 and `-g` rewards are `L` times
+the old level-averaged values. Pure-IEM NFT training standardizes this positive
+scale, while combined rewards must retain their intended relative weights. The
+feature-convention identifier prevents reuse of old cached feature statistics.
 
 ## Equation 21
 
@@ -210,3 +211,25 @@ The full launcher is
 two-GPU integration smoke uses the adjacent `..._smoke_...` launcher. W&B logs
 to entity `mayavishnevsky-tel-aviv-university`, project
 `unsupervised_creativity_nft`.
+
+## Equation-10 Negative-g Objective
+
+Set `config.creativity.iem_objective = "negative_g"` to replace equation 21
+with the negative equation-10 cross term:
+
+```text
+mu_omega = (1 / M) sum_j Phi(x'_j)
+reward(x) = -g(x) = -Phi(x)^T mu_omega
+```
+
+The same equation-16 feature implementation, sigma schedule, and shared noise
+table are used. The default remains `expected_squared_distance`, preserving
+all existing presets and checkpoint behavior. Negative-g currently requires
+all references rather than candidate-specific nearest subsets.
+
+NFT accepts negative raw rewards. Its training path standardizes gathered
+rewards (or applies the configured per-prompt statistic tracker), so the sign
+of a common offset is not itself a problem; ordering and reward scale remain
+important relative to the KL coefficient. Alongside the existing
+`reward_iem` and `reward_avg` metrics, the globally averaged unnormalized
+value is logged to W&B as `rewards/NegativeG`.

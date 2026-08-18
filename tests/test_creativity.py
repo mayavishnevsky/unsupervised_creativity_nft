@@ -13,6 +13,7 @@ from flow_grpo.creativity import (
     cosine_distance_from_reference_mean,
     iem_features,
     iem_reward_from_reference_statistics,
+    negative_g_reward_from_reference_mean,
     mean_nearest_cosine_distance,
     mean_nearest_l2_distance,
     mean_pairwise_l2_distance,
@@ -37,7 +38,7 @@ class IEMFormulaTests(unittest.TestCase):
         self.assertTrue(torch.isclose(schedule[0], torch.tensor(1000.0), rtol=1e-5))
         self.assertTrue(torch.isclose(schedule[-1], torch.tensor(1.0), rtol=1e-5))
 
-    def test_equations_14_and_16_include_interval_normalization(self):
+    def test_equations_14_and_16_use_delta_gamma_sum(self):
         x_0 = torch.tensor([[[1.0, -0.5]], [[-0.25, 2.0]]])
         schedule = torch.tensor([2.0, 1.0, 0.5])
         noise_table = torch.tensor(
@@ -57,13 +58,12 @@ class IEMFormulaTests(unittest.TestCase):
         x_t = (x_0.unsqueeze(0) + sigma * noise_table) / (1.0 + sigma)
         e_gamma = x_0.unsqueeze(0) - x_t
         expected = (
-            (delta_gamma / len(probe_sigmas)).sqrt().reshape(-1, 1, 1, 1) * e_gamma
+            delta_gamma.sqrt().reshape(-1, 1, 1, 1) * e_gamma
         ).transpose(0, 1).flatten(start_dim=1)
 
         torch.testing.assert_close(features, expected)
         explicit_distance = (
             delta_gamma
-            / len(probe_sigmas)
             * (e_gamma[:, 0] - e_gamma[:, 1]).square().flatten(start_dim=1).sum(dim=1)
         ).sum()
         feature_distance = (features[0] - features[1]).square().sum()
@@ -87,6 +87,20 @@ class IEMFormulaTests(unittest.TestCase):
         direct_scores = (candidates[:, None] - references[None]).square().sum(dim=2).mean(dim=1)
 
         torch.testing.assert_close(equation_21_scores, direct_scores.double(), rtol=1e-5, atol=1e-6)
+
+    def test_negative_g_matches_direct_reference_inner_product_mean(self):
+        generator = torch.Generator().manual_seed(19)
+        references = torch.randn(9, 13, generator=generator)
+        candidates = torch.randn(4, 13, generator=generator)
+        mu_omega = references.double().mean(dim=0)
+
+        scores = negative_g_reward_from_reference_mean(candidates, mu_omega)
+        direct = -(
+            candidates.double()[:, None, :]
+            * references.double()[None, :, :]
+        ).sum(dim=2).mean(dim=1)
+
+        torch.testing.assert_close(scores, direct)
 
     def test_cosine_reference_mean_matches_direct_pairwise_average(self):
         references = torch.nn.functional.normalize(
@@ -746,6 +760,7 @@ class IEMRewardFlowTests(unittest.TestCase):
             reward.state_dict(),
             {
                 "distance_metric": "iem",
+                "iem_objective": "expected_squared_distance",
                 "reference_prompt_mode": "same_prompt",
                 "reference_selection_mode": "all",
                 "nearest_reference_fraction": 0.1,

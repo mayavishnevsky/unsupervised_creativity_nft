@@ -44,8 +44,9 @@ IMAGE_DISTANCE_MODEL_FIELDS = {
     "dino_l2": "dino_model_id",
     "tpips_overall": "tpips_model_id",
 }
-IEM_FEATURE_WEIGHTING = "sqrt_delta_gamma_div_num_steps_v1"
+IEM_FEATURE_WEIGHTING = "sqrt_delta_gamma_v1"
 IEM_NOISE_ASSIGNMENT = "rank_permutation_v1"
+IEM_OBJECTIVES = ("expected_squared_distance", "negative_g")
 IEM_ASSIGNMENT_SEED_OFFSET = 60_000_000
 IEM_NOISE_SEED_OFFSET = 90_000_000
 SUPPORTED_DISTANCE_METRICS = ("iem", *IMAGE_DISTANCE_MODEL_FIELDS)
@@ -357,7 +358,7 @@ def iem_features(
         velocity = velocity_prediction(flat_x_t, flat_t).float().reshape_as(x_t)
         f_x_t = x_t - flow_time.reshape((-1, 1) + broadcast_tail) * velocity
         e_gamma = x_0.unsqueeze(0) - f_x_t
-        weights = (delta_gamma[start:stop] / interval_count).sqrt()
+        weights = delta_gamma[start:stop].sqrt()
         weighted = weights.reshape((-1, 1) + broadcast_tail) * e_gamma
         feature_blocks.append(weighted.transpose(0, 1).flatten(start_dim=1))
 
@@ -437,6 +438,44 @@ def iem_reward_from_reference_statistics(
     if v_omega.numel() != 1 or not torch.isfinite(v_omega) or v_omega < 0:
         raise ValueError("v_omega must be a finite non-negative scalar")
     return (features - mu_omega).square().sum(dim=1, dtype=torch.float64) + v_omega
+
+
+def negative_g_reward_from_reference_mean(
+    features: Tensor,
+    mu_omega: Tensor,
+) -> Tensor:
+    """Evaluate equation 10's ``-g(x) = -Phi(x)^T mu_omega``.
+
+    Equation 16 already includes the quadrature weights and shared noise table.
+    Averaging ``Phi(x)^T Phi(X)`` over references therefore only requires
+    their feature mean ``mu_omega``.
+    """
+
+    features = torch.as_tensor(features)
+    if features.ndim != 2:
+        raise ValueError(
+            f"features must have shape (N, D), got {tuple(features.shape)}"
+        )
+    mu_omega = torch.as_tensor(mu_omega, device=features.device)
+    if mu_omega.shape != features.shape[1:]:
+        raise ValueError("mu_omega and candidate feature dimensions do not match")
+    return -(features.double() * mu_omega.double()).sum(dim=1)
+
+
+def iem_objective_from_reference_statistics(
+    features: Tensor,
+    mu_omega: Tensor,
+    v_omega: Tensor | float,
+    objective: str,
+) -> Tensor:
+    """Evaluate the configured objective from one shared IEM reference cloud."""
+
+    objective = str(objective).lower()
+    if objective == "expected_squared_distance":
+        return iem_reward_from_reference_statistics(features, mu_omega, v_omega)
+    if objective == "negative_g":
+        return negative_g_reward_from_reference_mean(features, mu_omega)
+    raise ValueError("IEM objective must be one of: " + ", ".join(IEM_OBJECTIVES))
 
 
 def update_reference_feature_sum(
@@ -698,6 +737,9 @@ class IEMReward:
         self.distance_metric = str(
             getattr(config, "distance_metric", "iem")
         ).lower()
+        self.iem_objective = str(
+            getattr(config, "iem_objective", "expected_squared_distance")
+        ).lower()
         self.reference_prompt_mode = str(
             getattr(config, "reference_prompt_mode", "diverse")
         )
@@ -757,6 +799,8 @@ class IEMReward:
 
     @property
     def reward_log_name(self) -> str:
+        if self.distance_metric == "iem" and self.iem_objective == "negative_g":
+            return "NegativeG"
         return {
             "iem": "IEM",
             "clip_cosine": "CLIPCosineDistance",
@@ -780,6 +824,20 @@ class IEMReward:
         if self.reference_selection_mode not in ("all", "nearest"):
             raise ValueError(
                 "creativity.reference_selection_mode must be 'all' or 'nearest'"
+            )
+        if self.iem_objective not in IEM_OBJECTIVES:
+            raise ValueError(
+                "creativity.iem_objective must be one of: "
+                + ", ".join(IEM_OBJECTIVES)
+            )
+        if (
+            self.distance_metric == "iem"
+            and self.iem_objective == "negative_g"
+            and self.reference_selection_mode != "all"
+        ):
+            raise ValueError(
+                "creativity.iem_objective='negative_g' requires "
+                "reference_selection_mode='all'"
             )
         if not 0.0 < self.nearest_reference_fraction <= 1.0:
             raise ValueError(
@@ -984,6 +1042,7 @@ class IEMReward:
             state = {}
         return {
             "distance_metric": self.distance_metric,
+            "iem_objective": self.iem_objective,
             "reference_prompt_mode": self.reference_prompt_mode,
             "reference_selection_mode": self.reference_selection_mode,
             "nearest_reference_fraction": self.nearest_reference_fraction,
@@ -996,6 +1055,9 @@ class IEMReward:
 
     def load_state_dict(self, state: dict) -> None:
         saved_metric = str(state.get("distance_metric", "iem"))
+        saved_iem_objective = str(
+            state.get("iem_objective", "expected_squared_distance")
+        )
         saved_mode = str(state.get("reference_prompt_mode", "diverse"))
         saved_selection_mode = str(
             state.get("reference_selection_mode", "all")
@@ -1005,6 +1067,12 @@ class IEMReward:
                 "checkpoint creativity.distance_metric "
                 f"is {saved_metric!r}, but the current config uses "
                 f"{self.distance_metric!r}"
+            )
+        if saved_iem_objective != self.iem_objective:
+            raise ValueError(
+                "checkpoint creativity.iem_objective "
+                f"is {saved_iem_objective!r}, but the current config uses "
+                f"{self.iem_objective!r}"
             )
         if saved_mode != self.reference_prompt_mode:
             raise ValueError(
@@ -1792,10 +1860,11 @@ class IEMReward:
                 level_batch_size=int(self.config.level_batch_size),
             )
             scores.append(
-                iem_reward_from_reference_statistics(
+                iem_objective_from_reference_statistics(
                     features,
                     mu_omega,
                     v_omega,
+                    self.iem_objective,
                 )
             )
         return torch.cat(scores)
@@ -2092,10 +2161,11 @@ class IEMReward:
                         )
                         scores[
                             candidate_batch_start:candidate_batch_stop
-                        ] = iem_reward_from_reference_statistics(
+                        ] = iem_objective_from_reference_statistics(
                             candidate_features,
                             mu_omega,
                             v_omega,
+                            self.iem_objective,
                         )
                     candidate_features_seconds += (
                         synchronized_time(self.accelerator.device) - stage_start
@@ -2350,10 +2420,11 @@ class IEMReward:
                         noise_table,
                         level_batch_size=int(self.config.level_batch_size),
                     )
-                    scores[row_batch] = iem_reward_from_reference_statistics(
+                    scores[row_batch] = iem_objective_from_reference_statistics(
                         features,
                         mu_omega,
                         v_omega,
+                        self.iem_objective,
                     )
                 candidate_features_seconds += synchronized_time(self.accelerator.device) - stage_start
 

@@ -96,6 +96,13 @@ the old level-averaged values. Pure-IEM NFT training standardizes this positive
 scale, while combined rewards must retain their intended relative weights. The
 feature-convention identifier prevents reuse of old cached feature statistics.
 
+Independent integration levels are evaluated in bounded parallel chunks. The
+chunk tensor is flattened in `[level, endpoint]` order, and the timestep vector
+uses `flow_time.repeat_interleave(endpoint_count)` to preserve that alignment.
+The default `level_batch_size=4` turns 64 levels into 16 denoiser forwards; 64
+uses one forward when GPU activation memory permits. `level_batch_size` must
+divide `num_steps` exactly.
+
 ## Equation 21
 
 Reference features are accumulated as only three quantities:
@@ -162,6 +169,21 @@ NumPy / Torch / CUDA RNG states, creativity reservoir state, resolved config,
 and a standard exported `default` LoRA. `_SUCCESS` and `checkpoints/latest`
 identify complete checkpoints. Resume restores this complete state at the next
 epoch (`flow_grpo/nft_creativity_runtime.py:243`).
+
+## Candidate prompt schedules
+
+`independent_epoch` remains the default and preserves NFT's original fresh
+per-epoch permutation. The opt-in `no_repeat_cycle` mode loads all configured
+`creativity.candidate_prompt_files`, removes duplicate prompt text
+case-insensitively, and interleaves independently shuffled files according to
+`creativity.candidate_prompt_source_weights` (equal weights when null). The
+source ratio remains fixed: each file repeats its own shuffled order after that
+file is exhausted, without transferring quota to longer files. Thus 1,000/200
+prompts at weights 0.5/0.5 remain 50%/50%, while the shorter source cycles five
+times during one cycle of the longer source. Weighted-fair rounding handles
+epoch sizes that cannot express a ratio exactly. Epoch-indexed deterministic
+slices make this behavior distributed- and resume-safe without checkpointing a
+cursor.
 
 ## RAM-aligned inputs
 

@@ -215,6 +215,7 @@ def sd3_iem_same_prompt_partiprompts():
     creativity.sigma_min = 0.009
     creativity.sigma_max = 1000.0
     creativity.num_steps = 64
+    # Levels per forward; must divide num_steps. Effective batch also includes endpoints.
     creativity.level_batch_size = 4
     creativity.noise_table_count = 8
     creativity.reference_prompt_mode = "same_prompt"
@@ -227,6 +228,8 @@ def sd3_iem_same_prompt_partiprompts():
     creativity.candidate_prompt_files = [
         os.path.join(repo_root, "dataset/partiprompts_basic/train.txt")
     ]
+    creativity.candidate_prompt_sampling_mode = "independent_epoch"
+    creativity.candidate_prompt_source_weights = None
     creativity.reference_cache_dir = None
     creativity.reference_cache_spec_sha256 = None
     creativity.reference_samples_per_epoch = 48
@@ -270,6 +273,25 @@ def sd3_iem_same_prompt_partiprompts_ram_aligned():
     config.creativity.num_inference_steps = 20
     config.run_name += "_ram_aligned"
     config.save_dir += "_ram_aligned"
+    return config
+
+
+def sd3_iem_same_prompt_mixed_no_repeat():
+    """Use fixed 50/25/25 source quotas with per-source no-repeat cycles."""
+
+    config = sd3_iem_same_prompt_partiprompts()
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    prompt_files = [
+        os.path.join(repo_root, "dataset/hpdv3_plusplus/train.txt"),
+        os.path.join(repo_root, "dataset/creative_chat/creative_chat_train.txt"),
+        os.path.join(repo_root, "dataset/partiprompts_basic/train.txt"),
+    ]
+    config.creativity.candidate_prompt_files = prompt_files
+    config.creativity.reference_prompt_files = prompt_files
+    config.creativity.candidate_prompt_sampling_mode = "no_repeat_cycle"
+    config.creativity.candidate_prompt_source_weights = [0.5, 0.25, 0.25]
+    config.run_name += "_mixed_no_repeat"
+    config.save_dir += "_mixed_no_repeat"
     return config
 
 

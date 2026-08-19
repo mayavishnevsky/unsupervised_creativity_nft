@@ -134,6 +134,19 @@ class BalancedPromptSampler:
                 source.append(record)
             self._sources.append(source)
 
+        # A no-repeat cycle treats prompt text case-insensitively across every
+        # source. The first source containing a duplicate owns that prompt.
+        seen_cycle_prompts: set[str] = set()
+        self._cycle_sources: list[list[PromptRecord]] = []
+        for source in self._sources:
+            unique_source = []
+            for record in source:
+                key = record.text.casefold()
+                if key in seen_cycle_prompts:
+                    continue
+                seen_cycle_prompts.add(key)
+                unique_source.append(record)
+            self._cycle_sources.append(unique_source)
         self.source_sha256 = digest.hexdigest()
 
     def __len__(self) -> int:
@@ -144,6 +157,134 @@ class BalancedPromptSampler:
         if prompt_id < 0 or prompt_id >= len(self._records):
             raise ValueError(f"prompt id is out of range: {prompt_id}")
         return self._records[prompt_id].text
+
+    def _validated_source_weights(
+        self,
+        source_weights: Sequence[float] | None,
+    ) -> tuple[float, ...]:
+        if source_weights is None:
+            return (1.0,) * len(self._sources)
+        if isinstance(source_weights, (str, bytes)):
+            raise ValueError("candidate prompt source weights must be a sequence")
+        weights = tuple(float(value) for value in source_weights)
+        if len(weights) != len(self._sources):
+            raise ValueError(
+                "candidate prompt source weights must match candidate_prompt_files: "
+                f"got {len(weights)} weights for {len(self._sources)} files"
+            )
+        if any(not math.isfinite(value) or value <= 0.0 for value in weights):
+            raise ValueError("candidate prompt source weights must be finite and positive")
+        return weights
+
+    def _no_repeat_source_order(
+        self,
+        seed: int,
+        source_index: int,
+    ) -> list[PromptRecord]:
+        """Return the fixed shuffled order repeated by one prompt source."""
+
+        source = self._cycle_sources[source_index]
+        if not source:
+            raise ValueError(
+                f"prompt source {self.paths[source_index]} has no unique prompts"
+            )
+        payload = (
+            f"prompt-source-order\0{int(seed)}\0{source_index}\0"
+            f"{self.source_sha256}"
+        ).encode("utf-8")
+        order_seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "little")
+        order = list(source)
+        random.Random(order_seed).shuffle(order)
+        return order
+
+    def sample_no_repeat_cycle(
+        self,
+        count: int,
+        seed: int,
+        epoch: int,
+        source_weights: Sequence[float] | None = None,
+    ) -> list[PromptRecord]:
+        """Keep source ratios fixed and cycle each source independently."""
+
+        count = int(count)
+        epoch = int(epoch)
+        if count < 1:
+            raise ValueError(f"prompt sample count must be positive, got {count}")
+        if epoch < 0:
+            raise ValueError(f"epoch must be non-negative, got {epoch}")
+
+        weights = self._validated_source_weights(source_weights)
+        source_orders = [
+            self._no_repeat_source_order(seed, source_index)
+            for source_index in range(len(self._cycle_sources))
+        ]
+        total_weight = sum(weights)
+        absolute_start = epoch * count
+        absolute_stop = absolute_start + count
+        credits = [0.0] * len(source_orders)
+        source_counts = [0] * len(source_orders)
+        schedule_payload = (
+            f"prompt-source-schedule\0{int(seed)}\0{self.source_sha256}"
+        ).encode("utf-8")
+        schedule_seed = int.from_bytes(
+            hashlib.sha256(schedule_payload).digest()[:8],
+            "little",
+        )
+        source_order = list(range(len(source_orders)))
+        random.Random(schedule_seed).shuffle(source_order)
+        tie_rank = {source_index: rank for rank, source_index in enumerate(source_order)}
+        selected: list[PromptRecord] = []
+
+        for position in range(absolute_stop):
+            for index in range(len(source_orders)):
+                credits[index] += weights[index]
+            selected_source = max(
+                range(len(source_orders)),
+                key=lambda index: (credits[index], -tie_rank[index]),
+            )
+            credits[selected_source] -= total_weight
+            occurrence_index = source_counts[selected_source]
+            source_counts[selected_source] = occurrence_index + 1
+            if position >= absolute_start:
+                order = source_orders[selected_source]
+                selected.append(order[occurrence_index % len(order)])
+
+        order_payload = f"prompt-epoch-order\0{int(seed)}\0{epoch}".encode("utf-8")
+        order_seed = int.from_bytes(
+            hashlib.sha256(order_payload).digest()[:8],
+            "little",
+        )
+        random.Random(order_seed).shuffle(selected)
+        return selected
+
+    def sample_for_epoch(
+        self,
+        count: int,
+        seed: int,
+        epoch: int,
+        mode: str = "independent_epoch",
+        source_weights: Sequence[float] | None = None,
+    ) -> list[PromptRecord]:
+        """Sample candidates using the legacy or per-source no-repeat schedule."""
+
+        mode = str(mode)
+        if mode == "independent_epoch":
+            if source_weights is not None:
+                raise ValueError(
+                    "candidate prompt source weights require no_repeat_cycle mode"
+                )
+            return self.sample(count, seed=int(seed) + int(epoch))
+        if mode == "no_repeat_cycle":
+            return self.sample_no_repeat_cycle(
+                count,
+                seed=seed,
+                epoch=epoch,
+                source_weights=source_weights,
+            )
+        raise ValueError(
+            "candidate prompt sampling mode must be independent_epoch or "
+            f"no_repeat_cycle, got {mode!r}"
+        )
 
     def sample(
         self,
@@ -311,13 +452,20 @@ def iem_features(
     velocity_prediction: Callable[[Tensor, Tensor], Tensor],
     sigma_schedule: Tensor | Sequence[float],
     noise_table: Tensor,
-    level_batch_size: int = 1,
+    level_batch_size: int = 4,
 ) -> Tensor:
-    """Compute the normalized finite IEM feature map from equation 16.
+    """Compute equation 16 with independent noise levels in batched forwards.
 
     SD3 predicts rectified-flow velocity ``v = epsilon - x_0`` at
     ``x_t = (1-t)x_0 + t epsilon``. Consequently the clean prediction requested
     by equation 14 is ``f(x_t) = x_t - t v(x_t, t)``.
+
+    Each denoiser call handles at most ``level_batch_size`` integration levels.
+    Inputs are flattened in level-major order, and every level's flow time is
+    repeated once per endpoint so sigma, noise, timestep, and condition stay
+    aligned. Setting ``level_batch_size`` to the number of levels performs one
+    denoiser forward; smaller values bound activation memory without changing
+    the result.
     """
 
     x_0 = torch.as_tensor(x_0).float()
@@ -328,6 +476,11 @@ def iem_features(
     level_batch_size = int(level_batch_size)
     if level_batch_size < 1:
         raise ValueError(f"level_batch_size must be positive, got {level_batch_size}")
+    if interval_count % level_batch_size:
+        raise ValueError(
+            f"level_batch_size ({level_batch_size}) must divide the number "
+            f"of IEM levels ({interval_count}) exactly"
+        )
 
     noise_table = torch.as_tensor(noise_table)
     expected_tail = tuple(x_0.shape[1:])
@@ -353,8 +506,10 @@ def iem_features(
             x_0.unsqueeze(0) + sigma.reshape((-1, 1) + broadcast_tail) * noise
         ) / (1.0 + sigma).reshape((-1, 1) + broadcast_tail)
 
+        # x_t is [level, endpoint, ...], so flattening is level-major. Match it
+        # with [t_0 repeated B times, t_1 repeated B times, ...].
         flat_x_t = x_t.flatten(0, 1)
-        flat_t = flow_time[:, None].expand(-1, x_0.shape[0]).reshape(-1)
+        flat_t = flow_time.repeat_interleave(x_0.shape[0])
         velocity = velocity_prediction(flat_x_t, flat_t).float().reshape_as(x_t)
         f_x_t = x_t - flow_time.reshape((-1, 1) + broadcast_tail) * velocity
         e_gamma = x_0.unsqueeze(0) - f_x_t

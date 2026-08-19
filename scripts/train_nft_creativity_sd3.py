@@ -36,7 +36,11 @@ import random
 from torch.utils.data import Dataset, DataLoader
 from flow_grpo.ema import EMAModuleWrapper
 from flow_grpo.baseline_lora import merge_frozen_baseline_lora, validate_no_cfg
-from flow_grpo.creativity import TorchDistributedContext, synchronized_time
+from flow_grpo.creativity import (
+    BalancedPromptSampler,
+    TorchDistributedContext,
+    synchronized_time,
+)
 from flow_grpo.nft_validation import render_fixed_validation
 from flow_grpo.nft_creativity_runtime import (
     CreativityRewardSet,
@@ -81,10 +85,22 @@ def set_seed(seed: int, rank: int = 0):
 
 
 class TextPromptDataset(Dataset):
-    def __init__(self, dataset, split="train"):
-        self.file_path = os.path.join(dataset, f"{split}.txt")
-        with open(self.file_path, "r") as f:
-            self.prompts = [line.strip() for line in f.readlines()]
+    def __init__(self, dataset, split="train", prompt_files=None):
+        if prompt_files is None:
+            self.file_path = os.path.join(dataset, f"{split}.txt")
+            self.file_paths = [self.file_path]
+            with open(self.file_path, "r") as handle:
+                self.prompts = [line.strip() for line in handle.readlines()]
+            return
+
+        self.file_paths = [str(path) for path in prompt_files]
+        self.file_path = self.file_paths[0]
+        self.prompts = []
+        for path in self.file_paths:
+            with open(path, "r", encoding="utf-8") as handle:
+                self.prompts.extend(
+                    line.strip() for line in handle if line.strip()
+                )
 
     def __len__(self):
         return len(self.prompts)
@@ -304,9 +320,33 @@ def main(_):
     )
 
     # --- Datasets and Dataloaders ---
+    prompt_sampling_mode = str(
+        getattr(config.creativity, "candidate_prompt_sampling_mode", "independent_epoch")
+    )
+    candidate_prompt_sampler = None
     if config.prompt_fn == "general_ocr":
-        train_dataset = TextPromptDataset(config.dataset, "train")
+        if prompt_sampling_mode == "no_repeat_cycle":
+            candidate_prompt_sampler = BalancedPromptSampler(
+                config.creativity.candidate_prompt_files
+            )
+            train_dataset = TextPromptDataset(
+                config.dataset,
+                "train",
+                prompt_files=config.creativity.candidate_prompt_files,
+            )
+            expected_prompts = [
+                candidate_prompt_sampler.prompt_for_id(index)
+                for index in range(len(candidate_prompt_sampler))
+            ]
+            if train_dataset.prompts != expected_prompts:
+                raise ValueError(
+                    "candidate prompt files do not align with NFT dataset indices"
+                )
+        else:
+            train_dataset = TextPromptDataset(config.dataset, "train")
     elif config.prompt_fn == "geneval":
+        if prompt_sampling_mode == "no_repeat_cycle":
+            raise ValueError("no_repeat_cycle currently requires text prompt files")
         train_dataset = GenevalPromptDataset(config.dataset, "train")
     else:
         raise NotImplementedError("Prompt function not supported with dataset")
@@ -321,6 +361,13 @@ def main(_):
         seed=config.seed,
         ram_aligned=bool(
             getattr(config.sample, "ram_aligned_prompt_sampling", False)
+        ),
+        prompt_sampler=candidate_prompt_sampler,
+        sampling_mode=prompt_sampling_mode,
+        source_weights=getattr(
+            config.creativity,
+            "candidate_prompt_source_weights",
+            None,
         ),
     )
     if len(train_sampler) != int(config.sample.num_batches_per_epoch):

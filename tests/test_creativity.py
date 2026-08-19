@@ -19,6 +19,7 @@ from flow_grpo.creativity import (
     mean_pairwise_l2_distance,
     iem_schedule_terms,
     iem_sigma_schedule,
+    repeat_endpoint_conditions,
     sample_iem_noise_table,
     same_prompt_reference_seed,
     update_reference_feature_sum,
@@ -68,6 +69,115 @@ class IEMFormulaTests(unittest.TestCase):
         ).sum()
         feature_distance = (features[0] - features[1]).square().sum()
         torch.testing.assert_close(feature_distance, explicit_distance)
+
+    def test_level_batches_match_sequential_features_and_align_timesteps(self):
+        generator = torch.Generator().manual_seed(23)
+        x_0 = torch.randn(2, 1, 3, generator=generator)
+        schedule = torch.tensor([9.0, 5.0, 3.0, 2.0, 1.2, 0.7, 0.3])
+        noise_table = torch.randn(6, 2, 1, 3, generator=generator)
+        calls = []
+
+        def velocity(x_t, flow_time):
+            calls.append((x_t.clone(), flow_time.clone()))
+            time = flow_time.reshape((-1,) + (1,) * (x_t.ndim - 1))
+            return 0.125 * x_t.square() + 0.75 * time
+
+        batched = iem_features(
+            x_0,
+            velocity,
+            schedule,
+            noise_table,
+            level_batch_size=3,
+        )
+        sequential = iem_features(
+            x_0,
+            lambda x_t, flow_time: (
+                0.125 * x_t.square()
+                + 0.75
+                * flow_time.reshape((-1,) + (1,) * (x_t.ndim - 1))
+            ),
+            schedule,
+            noise_table,
+            level_batch_size=1,
+        )
+        torch.testing.assert_close(batched, sequential)
+
+        probe_sigmas, _ = iem_schedule_terms(schedule)
+        flow_times = probe_sigmas / (1.0 + probe_sigmas)
+        sigma = probe_sigmas.reshape(-1, 1, 1, 1)
+        expected_x_t = (
+            x_0.unsqueeze(0) + sigma * noise_table
+        ) / (1.0 + sigma)
+        self.assertEqual(len(calls), 2)
+        for call_index, start in enumerate(range(0, len(probe_sigmas), 3)):
+            stop = min(start + 3, len(probe_sigmas))
+            actual_x_t, actual_t = calls[call_index]
+            torch.testing.assert_close(
+                actual_x_t,
+                expected_x_t[start:stop].flatten(0, 1),
+            )
+            torch.testing.assert_close(
+                actual_t,
+                flow_times[start:stop].repeat_interleave(x_0.shape[0]),
+            )
+
+    def test_level_batch_size_must_divide_integration_levels(self):
+        x_0 = torch.zeros(1, 1, 2)
+        schedule = torch.tensor([4.0, 2.0, 1.0, 0.5])
+        noise_table = torch.zeros(3, 1, 1, 2)
+
+        with self.assertRaisesRegex(ValueError, "must divide"):
+            iem_features(
+                x_0,
+                lambda x_t, flow_time: torch.zeros_like(x_t),
+                schedule,
+                noise_table,
+                level_batch_size=2,
+            )
+
+    def test_level_batches_keep_endpoint_conditions_in_level_major_order(self):
+        x_0 = torch.zeros(3, 1, 2)
+        schedule = torch.tensor([8.0, 4.0, 2.0, 1.0, 0.5])
+        noise_table = torch.zeros(4, 1, 1, 2)
+        prompt_embeds = torch.tensor([[1.0], [10.0], [100.0]])
+        pooled_embeds = torch.tensor([[2.0], [20.0], [200.0]])
+        calls = []
+
+        def velocity(x_t, flow_time):
+            del flow_time
+            conditions, pooled = repeat_endpoint_conditions(
+                prompt_embeds,
+                pooled_embeds,
+                x_t.shape[0],
+            )
+            calls.append((conditions.clone(), pooled.clone()))
+            values = (conditions[:, 0] + 0.01 * pooled[:, 0]).reshape(-1, 1, 1)
+            return values.expand_as(x_t)
+
+        batched = iem_features(
+            x_0,
+            velocity,
+            schedule,
+            noise_table,
+            level_batch_size=2,
+        )
+        sequential = iem_features(
+            x_0,
+            lambda x_t, flow_time: (
+                prompt_embeds[:, 0] + 0.01 * pooled_embeds[:, 0]
+            ).reshape(-1, 1, 1).expand_as(x_t),
+            schedule,
+            noise_table,
+            level_batch_size=1,
+        )
+
+        torch.testing.assert_close(batched, sequential)
+        expected_conditions = prompt_embeds.repeat(2, 1)
+        expected_pooled = pooled_embeds.repeat(2, 1)
+        self.assertEqual(len(calls), 2)
+        for conditions, pooled in calls:
+            torch.testing.assert_close(conditions, expected_conditions)
+            torch.testing.assert_close(pooled, expected_pooled)
 
     def test_equation_21_matches_direct_pairwise_mean(self):
         generator = torch.Generator().manual_seed(7)
@@ -263,6 +373,74 @@ class PromptAndReservoirTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual({prefix: prefixes.count(prefix) for prefix in set(prefixes)}, {"s0": 2, "s1": 2, "s2": 2})
             self.assertNotIn("s0-0", [record.text for record in first])
+
+    def test_no_repeat_cycle_keeps_ratio_and_cycles_each_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for prefix, count in (("large", 10), ("small", 2)):
+                path = Path(directory) / f"{prefix}.txt"
+                path.write_text("".join(f"{prefix}-{index}\n" for index in range(count)))
+                paths.append(path)
+            sampler = BalancedPromptSampler(paths)
+
+            epochs = [
+                sampler.sample_for_epoch(
+                    4,
+                    seed=31,
+                    epoch=epoch,
+                    mode="no_repeat_cycle",
+                    source_weights=[0.5, 0.5],
+                )
+                for epoch in range(5)
+            ]
+            for records in epochs:
+                prefixes = [record.text.split("-")[0] for record in records]
+                self.assertEqual(prefixes.count("large"), 2)
+                self.assertEqual(prefixes.count("small"), 2)
+
+            all_records = [record.text for records in epochs for record in records]
+            large_records = [
+                text for text in all_records if text.startswith("large-")
+            ]
+            small_records = [
+                text for text in all_records if text.startswith("small-")
+            ]
+            self.assertEqual(len(large_records), 10)
+            self.assertEqual(len(set(large_records)), 10)
+            self.assertEqual(len(small_records), 10)
+            self.assertEqual(set(small_records), {"small-0", "small-1"})
+            self.assertEqual(len(set(small_records[:2])), 2)
+            self.assertEqual(
+                epochs[3],
+                sampler.sample_for_epoch(
+                    4,
+                    seed=31,
+                    epoch=3,
+                    mode="no_repeat_cycle",
+                    source_weights=[0.5, 0.5],
+                ),
+            )
+
+    def test_no_repeat_cycle_honors_source_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for prefix in ("a", "b"):
+                path = Path(directory) / f"{prefix}.txt"
+                path.write_text("".join(f"{prefix}-{index}\n" for index in range(20)))
+                paths.append(path)
+            sampler = BalancedPromptSampler(paths)
+
+            records = sampler.sample_no_repeat_cycle(
+                8,
+                seed=9,
+                epoch=0,
+                source_weights=[3, 1],
+            )
+            prefixes = [record.text.split("-")[0] for record in records]
+            self.assertEqual(prefixes.count("a"), 6)
+            self.assertEqual(prefixes.count("b"), 2)
+            with self.assertRaisesRegex(ValueError, "match candidate_prompt_files"):
+                sampler.sample_no_repeat_cycle(2, 9, 0, source_weights=[1])
 
     def test_reservoir_is_bounded_and_round_trips(self):
         reservoir = ReferenceReservoir(capacity=3, prompt_source_sha256="source-hash")
@@ -731,12 +909,14 @@ class IEMRewardFlowTests(unittest.TestCase):
                 zero_velocity,
                 reward.sigma_schedule,
                 noise_table,
+                level_batch_size=2,
             )
             candidate_features = iem_features(
                 candidate_latents[group_index * 2 : group_index * 2 + 2],
                 zero_velocity,
                 reward.sigma_schedule,
                 noise_table,
+                level_batch_size=2,
             )
             direct_scores = (
                 candidate_features[:, None] - reference_features[None]

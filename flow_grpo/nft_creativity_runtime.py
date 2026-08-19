@@ -34,6 +34,9 @@ class DistributedPromptGroupBatchSampler(Sampler[list[int]]):
         rank: int,
         seed: int = 0,
         ram_aligned: bool = False,
+        prompt_sampler: BalancedPromptSampler | None = None,
+        sampling_mode: str = "independent_epoch",
+        source_weights=None,
     ):
         self.dataset = dataset
         self.batch_size = int(batch_size)
@@ -43,9 +46,15 @@ class DistributedPromptGroupBatchSampler(Sampler[list[int]]):
         self.rank = int(rank)
         self.seed = int(seed)
         self.ram_aligned = bool(ram_aligned)
+        self.prompt_sampler = prompt_sampler
+        self.sampling_mode = str(sampling_mode)
+        self.source_weights = source_weights
         self.epoch = 0
 
-        if self.num_groups > len(dataset):
+        if (
+            self.num_groups > len(dataset)
+            and self.sampling_mode != "no_repeat_cycle"
+        ):
             raise ValueError("num_groups cannot exceed the number of training prompts")
         if self.num_groups % self.num_replicas:
             raise ValueError("num_groups must be divisible by the process count")
@@ -53,6 +62,17 @@ class DistributedPromptGroupBatchSampler(Sampler[list[int]]):
             raise ValueError("group_size must be divisible by the sampling batch size")
         if not 0 <= self.rank < self.num_replicas:
             raise ValueError("rank is outside the process range")
+        if self.sampling_mode not in ("independent_epoch", "no_repeat_cycle"):
+            raise ValueError(
+                "sampling_mode must be independent_epoch or no_repeat_cycle"
+            )
+        if self.sampling_mode == "no_repeat_cycle":
+            if self.prompt_sampler is None:
+                raise ValueError("no_repeat_cycle requires a BalancedPromptSampler")
+            if len(self.prompt_sampler) != len(self.dataset):
+                raise ValueError("prompt sampler IDs must align with the training dataset")
+        elif self.source_weights is not None:
+            raise ValueError("source weights require no_repeat_cycle mode")
 
     def __len__(self) -> int:
         groups_per_rank = self.num_groups // self.num_replicas
@@ -60,7 +80,16 @@ class DistributedPromptGroupBatchSampler(Sampler[list[int]]):
         return groups_per_rank * batches_per_group
 
     def __iter__(self):
-        if self.ram_aligned:
+        if self.sampling_mode == "no_repeat_cycle":
+            records = self.prompt_sampler.sample_for_epoch(
+                self.num_groups,
+                seed=self.seed,
+                epoch=self.epoch,
+                mode=self.sampling_mode,
+                source_weights=self.source_weights,
+            )
+            group_indices = [record.prompt_id for record in records]
+        elif self.ram_aligned:
             generator = random.Random(self.seed + self.epoch)
             group_indices = generator.sample(
                 range(len(self.dataset)), self.num_groups

@@ -85,6 +85,100 @@ class PromptGroupSamplerTests(unittest.TestCase):
 
 
 
+    def test_no_repeat_cycle_ratio_is_global_and_distributed_deterministically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for prefix, count in (("a", 8), ("b", 4)):
+                path = Path(directory) / f"{prefix}.txt"
+                path.write_text("".join(f"{prefix}-{index}\n" for index in range(count)))
+                paths.append(path)
+            prompt_sampler = BalancedPromptSampler(paths)
+            dataset = SizedDataset(len(prompt_sampler))
+
+            epoch_groups = []
+            for epoch in range(2):
+                rank_groups = []
+                for rank in range(2):
+                    sampler = DistributedPromptGroupBatchSampler(
+                        dataset,
+                        batch_size=2,
+                        group_size=2,
+                        num_groups=6,
+                        num_replicas=2,
+                        rank=rank,
+                        seed=13,
+                        prompt_sampler=prompt_sampler,
+                        sampling_mode="no_repeat_cycle",
+                        source_weights=[1, 1],
+                    )
+                    sampler.set_epoch(epoch)
+                    rank_groups.append([batch[0] for batch in sampler])
+                expected = [
+                    record.prompt_id
+                    for record in prompt_sampler.sample_for_epoch(
+                        6,
+                        seed=13,
+                        epoch=epoch,
+                        mode="no_repeat_cycle",
+                        source_weights=[1, 1],
+                    )
+                ]
+                self.assertEqual(rank_groups[0], expected[0::2])
+                self.assertEqual(rank_groups[1], expected[1::2])
+                combined = rank_groups[0] + rank_groups[1]
+                self.assertEqual(sum(prompt_id < 8 for prompt_id in combined), 3)
+                self.assertEqual(sum(prompt_id >= 8 for prompt_id in combined), 3)
+                epoch_groups.extend(rank_groups[0] + rank_groups[1])
+            self.assertEqual(len(epoch_groups), 12)
+            large_source_ids = [
+                prompt_id for prompt_id in epoch_groups if prompt_id < 8
+            ]
+            small_source_ids = [
+                prompt_id for prompt_id in epoch_groups if prompt_id >= 8
+            ]
+            self.assertEqual(len(set(large_source_ids)), 6)
+            self.assertEqual(len(set(small_source_ids)), 4)
+
+    def test_no_repeat_cycle_allows_reuse_after_source_exhaustion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "train.txt"
+            path.write_text("a\nb\nc\n")
+            prompt_sampler = BalancedPromptSampler([path])
+            sampler = DistributedPromptGroupBatchSampler(
+                SizedDataset(3),
+                batch_size=1,
+                group_size=1,
+                num_groups=6,
+                num_replicas=1,
+                rank=0,
+                seed=4,
+                prompt_sampler=prompt_sampler,
+                sampling_mode="no_repeat_cycle",
+                source_weights=[1],
+            )
+
+            group_ids = [batch[0] for batch in sampler]
+            self.assertEqual(len(group_ids), 6)
+            self.assertEqual(
+                {
+                    prompt_id: group_ids.count(prompt_id)
+                    for prompt_id in set(group_ids)
+                },
+                {0: 2, 1: 2, 2: 2},
+            )
+
+    def test_source_weights_require_no_repeat_mode(self):
+        with self.assertRaisesRegex(ValueError, "require no_repeat_cycle"):
+            DistributedPromptGroupBatchSampler(
+                SizedDataset(4),
+                batch_size=1,
+                group_size=1,
+                num_groups=2,
+                num_replicas=1,
+                rank=0,
+                source_weights=[1],
+            )
+
     def test_ram_aligned_draw_matches_balanced_prompt_sampler(self):
         prompts = [f"prompt-{index}" for index in range(20)]
         with tempfile.TemporaryDirectory() as directory:
@@ -122,6 +216,11 @@ class ConfigAndSeedTests(unittest.TestCase):
         self.assertEqual(config.eval_freq, 1)
         self.assertEqual(config.creativity.reference_prompt_mode, "same_prompt")
         self.assertEqual(config.creativity.reference_samples_per_prompt, 256)
+        self.assertEqual(
+            config.creativity.candidate_prompt_sampling_mode,
+            "independent_epoch",
+        )
+        self.assertIsNone(config.creativity.candidate_prompt_source_weights)
         self.assertEqual(
             config.creativity.iem_objective,
             "expected_squared_distance",

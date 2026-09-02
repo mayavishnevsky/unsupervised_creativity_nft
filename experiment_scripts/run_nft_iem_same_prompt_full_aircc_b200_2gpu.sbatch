@@ -27,10 +27,18 @@ RAM_ROOT=/shared/home/users/vishnevsky/unsupervised_creativity_ram_aircc
 BASELINE_LORA="$RAM_ROOT/assets/cfg_distilled_sd35m_checkpoint12/lora"
 TRAIN_BETA="${TRAIN_BETA:-0.01}"
 IEM_OBJECTIVE="${IEM_OBJECTIVE:-expected_squared_distance}"
+DENSITY_A1="${DENSITY_A1:-1}"
+DENSITY_A2="${DENSITY_A2:-1}"
 IEM_NUM_STEPS="${IEM_NUM_STEPS:-64}"
 IEM_LEVEL_BATCH_SIZE="${IEM_LEVEL_BATCH_SIZE:-4}"
 IEM_FEATURE_BATCH_SIZE="${IEM_FEATURE_BATCH_SIZE:-2}"
+EVAL_BEFORE_TRAINING="${EVAL_BEFORE_TRAINING:-true}"
+EVAL_FREQ="${EVAL_FREQ:-1}"
 REFERENCE_PROMPT_MODE="${REFERENCE_PROMPT_MODE:-same_prompt}"
+REFERENCE_CACHE_DIR="${REFERENCE_CACHE_DIR:-}"
+REFERENCE_CACHE_SPEC_SHA256="${REFERENCE_CACHE_SPEC_SHA256:-}"
+REFERENCE_CACHE_NUM_INFERENCE_STEPS="${REFERENCE_CACHE_NUM_INFERENCE_STEPS:-20}"
+REFERENCE_CACHE_USE_IEM_STATISTICS="${REFERENCE_CACHE_USE_IEM_STATISTICS:-true}"
 CONFIG_NAME="${CONFIG_NAME:-sd3_iem_same_prompt_partiprompts}"
 RUN_LABEL="${RUN_LABEL:-nft_iem_same_prompt_full}"
 RUN_DIR="${RUN_DIR_OVERRIDE:-$ROOT/runs/${RUN_LABEL}_${SLURM_JOB_ID}}"
@@ -54,9 +62,38 @@ if (( IEM_NUM_STEPS % IEM_LEVEL_BATCH_SIZE != 0 )); then
   exit 2
 fi
 case "$IEM_OBJECTIVE" in
-  expected_squared_distance|negative_g) ;;
+  expected_squared_distance|negative_g|negative_log_p_plus_negative_g) ;;
   *)
-    echo "IEM_OBJECTIVE must be expected_squared_distance or negative_g" >&2
+    echo "IEM_OBJECTIVE must be expected_squared_distance, negative_g, or negative_log_p_plus_negative_g" >&2
+    exit 2
+    ;;
+esac
+for coefficient in "$DENSITY_A1" "$DENSITY_A2"; do
+  if ! [[ "$coefficient" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$ ]]; then
+    echo "DENSITY_A1 and DENSITY_A2 must be non-negative numbers" >&2
+    exit 2
+  fi
+done
+REFERENCE_CACHE_ARGS=()
+if [[ -n "$REFERENCE_CACHE_DIR" || -n "$REFERENCE_CACHE_SPEC_SHA256" ]]; then
+  if [[ -z "$REFERENCE_CACHE_DIR" || -z "$REFERENCE_CACHE_SPEC_SHA256" ]]; then
+    echo "REFERENCE_CACHE_DIR and REFERENCE_CACHE_SPEC_SHA256 must be set together" >&2
+    exit 2
+  fi
+  if ! [[ "$REFERENCE_CACHE_NUM_INFERENCE_STEPS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "REFERENCE_CACHE_NUM_INFERENCE_STEPS must be a positive integer" >&2
+    exit 2
+  fi
+  REFERENCE_CACHE_ARGS=(
+    --config.creativity.reference_cache_dir="$REFERENCE_CACHE_DIR"
+    --config.creativity.reference_cache_spec_sha256="$REFERENCE_CACHE_SPEC_SHA256"
+    --config.creativity.num_inference_steps="$REFERENCE_CACHE_NUM_INFERENCE_STEPS"
+  )
+fi
+case "$REFERENCE_CACHE_USE_IEM_STATISTICS" in
+  true|false) ;;
+  *)
+    echo "REFERENCE_CACHE_USE_IEM_STATISTICS must be true or false" >&2
     exit 2
     ;;
 esac
@@ -99,10 +136,17 @@ echo "Source: $REPO"
 echo "Run: $RUN_DIR"
 echo "KL regularization coefficient (config.train.beta): $TRAIN_BETA"
 echo "IEM objective: $IEM_OBJECTIVE"
+echo "Density objective coefficients: a1=$DENSITY_A1, a2=$DENSITY_A2"
 echo "IEM integration intervals: $IEM_NUM_STEPS"
 echo "IEM levels per denoiser forward: $IEM_LEVEL_BATCH_SIZE"
 echo "IEM clean features per chunk: $IEM_FEATURE_BATCH_SIZE"
 echo "Creativity reference prompt mode: $REFERENCE_PROMPT_MODE"
+echo "Reference cache: ${REFERENCE_CACHE_DIR:-disabled}"
+if [[ -n "$REFERENCE_CACHE_DIR" ]]; then
+  echo "Reference cache spec: $REFERENCE_CACHE_SPEC_SHA256"
+  echo "Cached reference inference steps: $REFERENCE_CACHE_NUM_INFERENCE_STEPS"
+  echo "Use cached IEM statistics: $REFERENCE_CACHE_USE_IEM_STATISTICS"
+fi
 nvidia-smi
 
 EXPECTED_GPU_COUNT="$NUM_GPUS" "$VENV/bin/python" - <<'PY'
@@ -142,10 +186,16 @@ cd "$REPO"
   --config.baseline_lora_path="$BASELINE_LORA" \
   --config.creativity.reference_prompt_mode="$REFERENCE_PROMPT_MODE" \
   --config.creativity.iem_objective="$IEM_OBJECTIVE" \
+  --config.creativity.density_a1="$DENSITY_A1" \
+  --config.creativity.density_a2="$DENSITY_A2" \
   --config.creativity.num_steps="$IEM_NUM_STEPS" \
   --config.creativity.level_batch_size="$IEM_LEVEL_BATCH_SIZE" \
   --config.creativity.feature_batch_size="$IEM_FEATURE_BATCH_SIZE" \
+  --config.creativity.reference_cache_use_iem_statistics="$REFERENCE_CACHE_USE_IEM_STATISTICS" \
+  "${REFERENCE_CACHE_ARGS[@]}" \
   --config.train.beta="$TRAIN_BETA" \
+  --config.eval_before_training="$EVAL_BEFORE_TRAINING" \
+  --config.eval_freq="$EVAL_FREQ" \
   --config.save_dir="$RUN_DIR" \
   --config.run_name="$RUN_NAME" \
   --config.wandb_project=unsupervised_creativity_nft \

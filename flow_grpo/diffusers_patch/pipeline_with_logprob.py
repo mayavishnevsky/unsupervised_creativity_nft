@@ -50,6 +50,7 @@ def pipeline_with_logprob(
     deterministic: bool = False,
     solver: str = "flow",
     model_type: str = "sd3",
+    denoiser_step_callback=None,
 ):
     height = height or self.default_sample_size * self.vae_scale_factor
     width = width or self.default_sample_size * self.vae_scale_factor
@@ -251,7 +252,15 @@ def pipeline_with_logprob(
     all_log_probs = []
 
     # 7. Denoising loop
-    latents, all_latents, all_log_probs = run_sampling(v_pred_fn, latents, sigmas, solver, deterministic, noise_level)
+    latents, all_latents, all_log_probs = run_sampling(
+        v_pred_fn,
+        latents,
+        sigmas,
+        solver,
+        deterministic,
+        noise_level,
+        denoiser_step_callback=denoiser_step_callback,
+    )
 
     if output_type == "latent":
         self.maybe_free_model_hooks()

@@ -31,6 +31,19 @@ OUTPUT_DIR="$EVALUATIONS_DIR/${TRAIN_RUN_LABEL}_${TRAIN_JOB_ID}_creative_probes_
 VENV="$ROOT/envs/nft-b200"
 RAM_ROOT=/shared/home/users/vishnevsky/unsupervised_creativity_ram_aircc
 BASELINE_LORA="$RAM_ROOT/assets/cfg_distilled_sd35m_checkpoint12/lora"
+ADAPTER_FULL_STRENGTH_STEPS="${ADAPTER_FULL_STRENGTH_STEPS:-}"
+ADAPTER_ZERO_STRENGTH_STEPS="${ADAPTER_ZERO_STRENGTH_STEPS:-}"
+ADAPTER_SCHEDULE_ARGS=()
+if [[ -n "$ADAPTER_FULL_STRENGTH_STEPS" || -n "$ADAPTER_ZERO_STRENGTH_STEPS" ]]; then
+  if [[ -z "$ADAPTER_FULL_STRENGTH_STEPS" || -z "$ADAPTER_ZERO_STRENGTH_STEPS" ]]; then
+    echo "ADAPTER_FULL_STRENGTH_STEPS and ADAPTER_ZERO_STRENGTH_STEPS must be set together" >&2
+    exit 2
+  fi
+  ADAPTER_SCHEDULE_ARGS=(
+    --adapter-full-strength-steps "$ADAPTER_FULL_STRENGTH_STEPS"
+    --adapter-zero-strength-steps "$ADAPTER_ZERO_STRENGTH_STEPS"
+  )
+fi
 
 export HOME=/shared/home/users/vishnevsky
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
@@ -78,6 +91,7 @@ cd "$REPO"
   --baseline-lora "$BASELINE_LORA" \
   --base-seed 0 \
   --batch-size 2 \
+  "${ADAPTER_SCHEDULE_ARGS[@]}" \
   --wandb-project unsupervised_creativity_nft \
   --wandb-entity mayavishnevsky-tel-aviv-university \
   --wandb-group "${TRAIN_RUN_LABEL}_${TRAIN_JOB_ID}" \

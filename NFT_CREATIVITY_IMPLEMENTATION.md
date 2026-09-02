@@ -162,6 +162,21 @@ Fixed validation is implemented in `flow_grpo/nft_validation.py:20`:
   (`flow_grpo/nft_creativity_runtime.py:74`), so every panel uses the same latent
   for a given prompt and different prompts receive different latents.
 
+Standalone creative probes can optionally decay only the trained NFT LoRA:
+
+```bash
+python scripts/evaluate_nft_creative_probes.py ... \
+  --adapter-full-strength-steps 10 \
+  --adapter-zero-strength-steps 10
+```
+
+For the standard 40-step evaluation this uses strength 1 for steps 1-10,
+twenty strictly interior linear interpolation values for steps 11-30, and
+strength 0 for steps 31-40. The CFG-distillation LoRA is already merged into
+the frozen baseline and is never scaled. Both flags must be supplied together.
+Omitting them preserves the original all-steps NFT adapter behavior. The
+manifest records the complete strength vector.
+
 Every completed epoch is checkpointed atomically before evaluation
 (`flow_grpo/nft_creativity_runtime.py:162`). A checkpoint includes both NFT
 adapters, optimizer, scaler, EMA, global step, next epoch, all per-rank Python /
@@ -255,3 +270,64 @@ of a common offset is not itself a problem; ordering and reward scale remain
 important relative to the KL coefficient. Alongside the existing
 `reward_iem` and `reward_avg` metrics, the globally averaged unnormalized
 value is logged to W&B as `rewards/NegativeG`.
+
+## Negative Log-density Plus Negative-g Objective
+
+The opt-in objective below combines the VLM analysis' pointwise conditional
+density estimator with the equation-10 cross term:
+
+```python
+config.creativity.iem_objective = "negative_log_p_plus_negative_g"
+config.creativity.density_a1 = 1.0
+config.creativity.density_a2 = 1.0
+config.creativity.reference_selection_mode = "all"
+```
+
+Its raw reward is
+
+```text
+reward(x) = -density_a1 * log p(x) + density_a2 * (-g(x))
+-g(x)     = -Phi(x)^T mu_omega
+```
+
+The coefficients are finite, non-negative, and not both zero. Their defaults
+are 1. Existing presets retain `expected_squared_distance`, so selecting no new
+objective preserves all prior NFT behavior. The ratio
+`density_a1:density_a2` controls the two terms. Under NFT's default reward
+standardization, a common positive multiplier on both coefficients is removed
+up to numerical epsilon; it changes the raw logged reward but not standardized
+reward ordering.
+
+For latent dimension `d`, `gamma_i = 1 / sigma_i^2`, and the existing `G - 1`
+IEM intervals, NFT evaluates
+
+```text
+log p(x) = 0.5 * sum_i (
+    d / (1 + gamma_i) - ||e_i(x)||^2
+) * delta_gamma_i - 0.5 * d * log(2*pi*e)
+```
+
+Each equation-16 feature block is `sqrt(delta_gamma_i) * e_i(x)`, so
+`||Phi(x)||^2` already equals the unaveraged residual sum. No `G - 1` division
+or compensating multiplication is used. The code checks the feature width
+against `d * (G - 1)` and accumulates density norms in FP64.
+
+The combined objective adds no denoiser evaluations. The candidate's single
+`Phi(x)` is reused by both terms, which guarantees the same frozen baseline
+denoiser, candidate prompt condition, sigma schedule, and exact noise table.
+NFT's trainable adapters remain disabled for these feature probes. Same-prompt
+references use the candidate prompt; diverse references use their own prompts,
+while `log p(x)` remains conditioned on the candidate prompt.
+
+The complete density identity is retained even though its normal-integral and
+entropy pieces are candidate-independent for one shape and schedule and thus
+cancel under reward centering. NFT logs the globally averaged raw combination
+as `rewards/NegativeLogPPlusNegativeG`; subsequent reward standardization and
+the configured KL coefficient still determine training scale.
+
+Like `negative_g`, this objective supports only all-reference statistics.
+Nearest subsets would make `mu_omega` candidate-specific and are rejected.
+RAM-aligned cached IEM statistics can be reused only when their schedule and
+noise seed/hash match. Checkpoints store the coefficients only for this mode
+and reject resume-time coefficient changes; absent fields use the documented
+defaults of 1.

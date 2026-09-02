@@ -315,3 +315,11 @@ HPSv2
 
 *.err
 reward_ckpts/
+
+# Local and cluster-generated run data
+*.orig
+aircc_checkpoints/
+aircc_evaluations/
+local_slurm_evaluations/
+outputs/
+experiment_scripts/slurm_logs/

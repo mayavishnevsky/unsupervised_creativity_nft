@@ -46,7 +46,14 @@ IMAGE_DISTANCE_MODEL_FIELDS = {
 }
 IEM_FEATURE_WEIGHTING = "sqrt_delta_gamma_v1"
 IEM_NOISE_ASSIGNMENT = "rank_permutation_v1"
-IEM_OBJECTIVES = ("expected_squared_distance", "negative_g")
+IEM_OBJECTIVES = (
+    "expected_squared_distance",
+    "negative_g",
+    "negative_log_p_plus_negative_g",
+)
+REFERENCE_MEAN_IEM_OBJECTIVES = frozenset(
+    ("negative_g", "negative_log_p_plus_negative_g")
+)
 IEM_ASSIGNMENT_SEED_OFFSET = 60_000_000
 IEM_NOISE_SEED_OFFSET = 90_000_000
 SUPPORTED_DISTANCE_METRICS = ("iem", *IMAGE_DISTANCE_MODEL_FIELDS)
@@ -617,11 +624,115 @@ def negative_g_reward_from_reference_mean(
     return -(features.double() * mu_omega.double()).sum(dim=1)
 
 
+def log_density_from_iem_features(
+    features: Tensor,
+    sigma_schedule: Tensor | Sequence[float],
+    signal_dimension: int,
+    *,
+    feature_chunk_size: int = 65_536,
+) -> Tensor:
+    """Estimate conditional ``log p(x)`` from equation-16 features.
+
+    The finite density identity is
+
+    ``log p(x) = 1/2 sum_i [d/(1+gamma_i) - ||e_i(x)||^2]``
+    ``             * delta_gamma_i - d/2 log(2*pi*e)``.
+
+    Every equation-16 feature block is ``sqrt(delta_gamma_i) * e_i(x)``.
+    Therefore ``||Phi(x)||^2`` is already the unaveraged residual sum; no
+    division or multiplication by the number of integration levels belongs
+    here. The denoiser condition and noise table are exactly those used to
+    construct ``features``.
+    """
+
+    features = torch.as_tensor(features)
+    if features.ndim != 2 or features.shape[0] < 1:
+        raise ValueError(
+            "features must have nonempty shape (batch, feature_dimension)"
+        )
+    signal_dimension = int(signal_dimension)
+    if signal_dimension < 1:
+        raise ValueError("signal_dimension must be positive")
+    feature_chunk_size = int(feature_chunk_size)
+    if feature_chunk_size < 1:
+        raise ValueError("feature_chunk_size must be positive")
+
+    probe_sigmas, delta_gamma = iem_schedule_terms(
+        sigma_schedule,
+        device=features.device,
+    )
+    expected_feature_dimension = signal_dimension * probe_sigmas.numel()
+    if features.shape[1] != expected_feature_dimension:
+        raise ValueError(
+            "feature dimension must equal signal_dimension times the number "
+            f"of IEM levels; got {features.shape[1]} and expected "
+            f"{expected_feature_dimension}"
+        )
+
+    gamma = probe_sigmas.double().reciprocal().square()
+    normal_integral = (
+        signal_dimension / (1.0 + gamma) * delta_gamma.double()
+    ).sum()
+    feature_norm_squared = torch.zeros(
+        features.shape[0],
+        device=features.device,
+        dtype=torch.float64,
+    )
+    for start in range(0, features.shape[1], feature_chunk_size):
+        stop = min(start + feature_chunk_size, features.shape[1])
+        feature_block = features[:, start:stop].double()
+        feature_norm_squared += feature_block.square().sum(dim=1)
+
+    entropy_constant = 0.5 * signal_dimension * math.log(
+        2.0 * math.pi * math.e
+    )
+    return 0.5 * (normal_integral - feature_norm_squared) - entropy_constant
+
+
+def negative_log_p_plus_negative_g_reward(
+    features: Tensor,
+    mu_omega: Tensor,
+    sigma_schedule: Tensor | Sequence[float],
+    signal_dimension: int,
+    *,
+    a1: float = 1.0,
+    a2: float = 1.0,
+) -> Tensor:
+    """Return ``-a1 * log p(x) + a2 * (-g(x))``.
+
+    ``-g(x)`` is equation 10 evaluated against the empirical reference mean.
+    Both terms reuse the same candidate feature vector, baseline denoiser,
+    prompt condition, integration schedule, and noise table.
+    """
+
+    a1 = float(a1)
+    a2 = float(a2)
+    if not math.isfinite(a1) or a1 < 0.0:
+        raise ValueError("a1 must be finite and non-negative")
+    if not math.isfinite(a2) or a2 < 0.0:
+        raise ValueError("a2 must be finite and non-negative")
+    if a1 == 0.0 and a2 == 0.0:
+        raise ValueError("a1 and a2 cannot both be zero")
+
+    log_p = log_density_from_iem_features(
+        features,
+        sigma_schedule,
+        signal_dimension,
+    )
+    negative_g = negative_g_reward_from_reference_mean(features, mu_omega)
+    return -a1 * log_p + a2 * negative_g
+
+
 def iem_objective_from_reference_statistics(
     features: Tensor,
     mu_omega: Tensor,
     v_omega: Tensor | float,
     objective: str,
+    *,
+    sigma_schedule: Tensor | Sequence[float] | None = None,
+    signal_dimension: int | None = None,
+    density_a1: float = 1.0,
+    density_a2: float = 1.0,
 ) -> Tensor:
     """Evaluate the configured objective from one shared IEM reference cloud."""
 
@@ -630,6 +741,20 @@ def iem_objective_from_reference_statistics(
         return iem_reward_from_reference_statistics(features, mu_omega, v_omega)
     if objective == "negative_g":
         return negative_g_reward_from_reference_mean(features, mu_omega)
+    if objective == "negative_log_p_plus_negative_g":
+        if sigma_schedule is None or signal_dimension is None:
+            raise ValueError(
+                "negative_log_p_plus_negative_g requires sigma_schedule "
+                "and signal_dimension"
+            )
+        return negative_log_p_plus_negative_g_reward(
+            features,
+            mu_omega,
+            sigma_schedule,
+            signal_dimension,
+            a1=density_a1,
+            a2=density_a2,
+        )
     raise ValueError("IEM objective must be one of: " + ", ".join(IEM_OBJECTIVES))
 
 
@@ -895,6 +1020,8 @@ class IEMReward:
         self.iem_objective = str(
             getattr(config, "iem_objective", "expected_squared_distance")
         ).lower()
+        self.density_a1 = float(getattr(config, "density_a1", 1.0))
+        self.density_a2 = float(getattr(config, "density_a2", 1.0))
         self.reference_prompt_mode = str(
             getattr(config, "reference_prompt_mode", "diverse")
         )
@@ -906,6 +1033,9 @@ class IEMReward:
         )
         self._image_processor = None
         self._image_encoder = None
+        self.reference_cache_use_iem_statistics = bool(
+            getattr(config, "reference_cache_use_iem_statistics", True)
+        )
         reference_cache_dir = getattr(config, "reference_cache_dir", None)
         self.reference_cache = (
             ReferenceCacheReader(
@@ -956,6 +1086,11 @@ class IEMReward:
     def reward_log_name(self) -> str:
         if self.distance_metric == "iem" and self.iem_objective == "negative_g":
             return "NegativeG"
+        if (
+            self.distance_metric == "iem"
+            and self.iem_objective == "negative_log_p_plus_negative_g"
+        ):
+            return "NegativeLogPPlusNegativeG"
         return {
             "iem": "IEM",
             "clip_cosine": "CLIPCosineDistance",
@@ -987,13 +1122,29 @@ class IEMReward:
             )
         if (
             self.distance_metric == "iem"
-            and self.iem_objective == "negative_g"
+            and self.iem_objective in REFERENCE_MEAN_IEM_OBJECTIVES
             and self.reference_selection_mode != "all"
         ):
             raise ValueError(
-                "creativity.iem_objective='negative_g' requires "
+                f"creativity.iem_objective={self.iem_objective!r} requires "
                 "reference_selection_mode='all'"
             )
+        if (
+            self.distance_metric == "iem"
+            and self.iem_objective == "negative_log_p_plus_negative_g"
+        ):
+            if not math.isfinite(self.density_a1) or self.density_a1 < 0.0:
+                raise ValueError(
+                    "creativity.density_a1 must be finite and non-negative"
+                )
+            if not math.isfinite(self.density_a2) or self.density_a2 < 0.0:
+                raise ValueError(
+                    "creativity.density_a2 must be finite and non-negative"
+                )
+            if self.density_a1 == 0.0 and self.density_a2 == 0.0:
+                raise ValueError(
+                    "creativity.density_a1 and density_a2 cannot both be zero"
+                )
         if not 0.0 < self.nearest_reference_fraction <= 1.0:
             raise ValueError(
                 "creativity.nearest_reference_fraction must be in (0, 1]"
@@ -1089,7 +1240,10 @@ class IEMReward:
                     cached.get("model_id") if isinstance(cached, dict) else None,
                     model_id,
                 )
-        if self.distance_metric == "iem":
+        if (
+            self.distance_metric == "iem"
+            and self.reference_cache_use_iem_statistics
+        ):
             cached_iem = spec.get("iem")
             expected_iem = {
                 "sigma_min": float(self.config.sigma_min),
@@ -1150,7 +1304,11 @@ class IEMReward:
         feature_dimension: int,
     ) -> tuple[Tensor, Tensor] | None:
         """Load statistics only when they match the candidate's exact noise."""
-        if self.reference_cache is None or self.reference_selection_mode != "all":
+        if (
+            self.reference_cache is None
+            or self.reference_selection_mode != "all"
+            or not self.reference_cache_use_iem_statistics
+        ):
             return None
         if not self.reference_cache.has_entry(epoch=epoch, prompt=prompt):
             return None
@@ -1203,6 +1361,15 @@ class IEMReward:
             "nearest_reference_fraction": self.nearest_reference_fraction,
             **state,
             **(
+                {
+                    "density_a1": self.density_a1,
+                    "density_a2": self.density_a2,
+                }
+                if self.distance_metric == "iem"
+                and self.iem_objective == "negative_log_p_plus_negative_g"
+                else {}
+            ),
+            **(
                 {"reference_cache_spec_sha256": self.reference_cache.spec_sha256}
                 if self.reference_cache is not None else {}
             ),
@@ -1229,6 +1396,23 @@ class IEMReward:
                 f"is {saved_iem_objective!r}, but the current config uses "
                 f"{self.iem_objective!r}"
             )
+        if (
+            self.distance_metric == "iem"
+            and self.iem_objective == "negative_log_p_plus_negative_g"
+        ):
+            for name in ("density_a1", "density_a2"):
+                saved_value = float(state.get(name, 1.0))
+                configured_value = float(getattr(self, name))
+                if not math.isclose(
+                    saved_value,
+                    configured_value,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    raise ValueError(
+                        f"checkpoint creativity.{name} is {saved_value}, "
+                        f"but the current config uses {configured_value}"
+                    )
         if saved_mode != self.reference_prompt_mode:
             raise ValueError(
                 "checkpoint creativity.reference_prompt_mode "
@@ -1991,6 +2175,27 @@ class IEMReward:
         return scores, metrics
 
     @torch.no_grad()
+    def _iem_objective_scores(
+        self,
+        features: Tensor,
+        mu_omega: Tensor,
+        v_omega: Tensor | float,
+        signal_shape: Sequence[int],
+    ) -> Tensor:
+        """Evaluate the configured IEM objective with one shared contract."""
+
+        return iem_objective_from_reference_statistics(
+            features,
+            mu_omega,
+            v_omega,
+            self.iem_objective,
+            sigma_schedule=self.sigma_schedule,
+            signal_dimension=math.prod(signal_shape),
+            density_a1=self.density_a1,
+            density_a2=self.density_a2,
+        )
+
+    @torch.no_grad()
     def _iem_scores_from_statistics(
         self,
         latents: Tensor,
@@ -2015,11 +2220,11 @@ class IEMReward:
                 level_batch_size=int(self.config.level_batch_size),
             )
             scores.append(
-                iem_objective_from_reference_statistics(
+                self._iem_objective_scores(
                     features,
                     mu_omega,
                     v_omega,
-                    self.iem_objective,
+                    latents.shape[1:],
                 )
             )
         return torch.cat(scores)
@@ -2316,11 +2521,11 @@ class IEMReward:
                         )
                         scores[
                             candidate_batch_start:candidate_batch_stop
-                        ] = iem_objective_from_reference_statistics(
+                        ] = self._iem_objective_scores(
                             candidate_features,
                             mu_omega,
                             v_omega,
-                            self.iem_objective,
+                            signal_shape,
                         )
                     candidate_features_seconds += (
                         synchronized_time(self.accelerator.device) - stage_start
@@ -2575,11 +2780,11 @@ class IEMReward:
                         noise_table,
                         level_batch_size=int(self.config.level_batch_size),
                     )
-                    scores[row_batch] = iem_objective_from_reference_statistics(
+                    scores[row_batch] = self._iem_objective_scores(
                         features,
                         mu_omega,
                         v_omega,
-                        self.iem_objective,
+                        signal_shape,
                     )
                 candidate_features_seconds += synchronized_time(self.accelerator.device) - stage_start
 

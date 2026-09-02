@@ -119,6 +119,27 @@ def fixed_validation_seed(base_seed: int, prompt: str) -> int:
     )
 
 
+def validation_prompt_seeds(base_seed: int, prompt: str, count: int) -> list[int]:
+    """Match RAM's seed family while retaining the legacy seed first."""
+
+    count = int(count)
+    if count <= 0:
+        raise ValueError("validation seeds per prompt must be positive")
+
+    seeds = [fixed_validation_seed(base_seed, prompt)]
+    for seed_index in range(1, count):
+        payload = (
+            f"ram-validation-replica\0{int(base_seed)}\0{prompt}\0{seed_index}"
+        ).encode("utf-8")
+        seeds.append(
+            int.from_bytes(hashlib.sha256(payload).digest()[:8], "little")
+            % (2**63 - 1)
+        )
+    if len(set(seeds)) != len(seeds):
+        raise RuntimeError("prompt-specific validation seed collision")
+    return seeds
+
+
 def validation_prompts(prompt_files, count: int, seed: int) -> list[str]:
     sampler = BalancedPromptSampler(prompt_files)
     return [record.text for record in sampler.sample(count, seed)]

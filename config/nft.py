@@ -210,6 +210,10 @@ def sd3_iem_same_prompt_partiprompts():
     creativity.enabled = True
     creativity.distance_metric = "iem"
     creativity.iem_objective = "expected_squared_distance"
+    # Used only by negative_log_p_plus_negative_g:
+    # reward = -density_a1 * log p(x) + density_a2 * (-g(x)).
+    creativity.density_a1 = 1.0
+    creativity.density_a2 = 1.0
     creativity.distance_metrics = ["iem"]
     creativity.reward_weights = ml_collections.ConfigDict({"iem": 1.0})
     creativity.sigma_min = 0.009
@@ -232,6 +236,9 @@ def sd3_iem_same_prompt_partiprompts():
     creativity.candidate_prompt_source_weights = None
     creativity.reference_cache_dir = None
     creativity.reference_cache_spec_sha256 = None
+    # Disable this for latent-only reuse when cached IEM statistics were
+    # produced by a different feature convention or integration schedule.
+    creativity.reference_cache_use_iem_statistics = True
     creativity.reference_samples_per_epoch = 48
     creativity.reference_bank_size = 4096
     creativity.reference_subset_size = 512

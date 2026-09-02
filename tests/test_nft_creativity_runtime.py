@@ -18,6 +18,7 @@ from flow_grpo.nft_creativity_runtime import (
     fixed_validation_seed,
     load_training_checkpoint,
     save_training_checkpoint,
+    validation_prompt_seeds,
 )
 
 
@@ -226,6 +227,8 @@ class ConfigAndSeedTests(unittest.TestCase):
             "expected_squared_distance",
         )
         self.assertEqual(config.creativity.num_steps, 64)
+        self.assertEqual(config.creativity.density_a1, 1.0)
+        self.assertEqual(config.creativity.density_a2, 1.0)
         self.assertEqual(config.creativity.sigma_min, 0.009)
         self.assertEqual(config.creativity.sigma_max, 1000.0)
         sampler = DistributedPromptGroupBatchSampler(
@@ -269,6 +272,13 @@ class ConfigAndSeedTests(unittest.TestCase):
             fixed_validation_seed(0, "a black cat"),
             fixed_validation_seed(0, "a white cat"),
         )
+
+    def test_validation_seed_family_keeps_legacy_seed_first(self):
+        seeds = validation_prompt_seeds(0, "a black cat", 8)
+        self.assertEqual(seeds[0], fixed_validation_seed(0, "a black cat"))
+        self.assertEqual(len(seeds), 8)
+        self.assertEqual(len(set(seeds)), 8)
+        self.assertEqual(seeds, validation_prompt_seeds(0, "a black cat", 8))
 
 
 class FixedReward:

@@ -1,3 +1,4 @@
+import math
 import tempfile
 import unittest
 from contextlib import contextmanager, nullcontext
@@ -12,7 +13,10 @@ from flow_grpo.creativity import (
     ReferenceReservoir,
     cosine_distance_from_reference_mean,
     iem_features,
+    iem_objective_from_reference_statistics,
     iem_reward_from_reference_statistics,
+    log_density_from_iem_features,
+    negative_log_p_plus_negative_g_reward,
     negative_g_reward_from_reference_mean,
     mean_nearest_cosine_distance,
     mean_nearest_l2_distance,
@@ -211,6 +215,113 @@ class IEMFormulaTests(unittest.TestCase):
         ).sum(dim=2).mean(dim=1)
 
         torch.testing.assert_close(scores, direct)
+
+    def test_log_density_recovers_unaveraged_residual_sum(self):
+        schedule = torch.tensor([4.0, 2.0, 1.0])
+        gamma = schedule.reciprocal().square()
+        delta_gamma = gamma[1:] - gamma[:-1]
+        residuals = (
+            torch.tensor([1.0, -2.0]),
+            torch.tensor([0.5, 0.5]),
+        )
+        features = torch.cat(
+            [
+                delta_gamma[index].sqrt() * residual
+                for index, residual in enumerate(residuals)
+            ]
+        ).reshape(1, -1)
+
+        actual = log_density_from_iem_features(
+            features,
+            schedule,
+            signal_dimension=2,
+            feature_chunk_size=2,
+        )
+
+        normal_sum = sum(
+            2.0 / (1.0 + gamma[index]) * delta_gamma[index]
+            for index in range(len(residuals))
+        )
+        residual_sum = sum(
+            residual.square().sum() * delta_gamma[index]
+            for index, residual in enumerate(residuals)
+        )
+        expected = (
+            0.5 * (normal_sum - residual_sum)
+            - math.log(2.0 * math.pi * math.e)
+        )
+        torch.testing.assert_close(actual, expected.reshape(1).double())
+
+    def test_log_density_rejects_feature_schedule_dimension_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "feature dimension"):
+            log_density_from_iem_features(
+                torch.zeros(2, 5),
+                torch.tensor([4.0, 2.0, 1.0]),
+                signal_dimension=2,
+            )
+
+    def test_negative_log_p_plus_negative_g_matches_explicit_terms(self):
+        schedule = torch.tensor([4.0, 2.0, 1.0])
+        features = torch.tensor(
+            [
+                [1.0, -2.0, 0.5, 0.5],
+                [-0.5, 1.0, 2.0, -1.5],
+            ]
+        )
+        mu_omega = torch.tensor([0.25, -0.5, 1.5, 0.75])
+        a1, a2 = 0.25, 1.75
+        expected = (
+            -a1 * log_density_from_iem_features(features, schedule, 2)
+            + a2
+            * -(
+                features.double() * mu_omega.double()
+            ).sum(dim=1)
+        )
+
+        actual = negative_log_p_plus_negative_g_reward(
+            features,
+            mu_omega,
+            schedule,
+            signal_dimension=2,
+            a1=a1,
+            a2=a2,
+        )
+        dispatched = iem_objective_from_reference_statistics(
+            features,
+            mu_omega,
+            v_omega=torch.tensor(123.0),
+            objective="negative_log_p_plus_negative_g",
+            sigma_schedule=schedule,
+            signal_dimension=2,
+            density_a1=a1,
+            density_a2=a2,
+        )
+
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(dispatched, expected)
+
+    def test_density_objective_validates_inputs(self):
+        features = torch.zeros(1, 4)
+        mu_omega = torch.zeros(4)
+        schedule = torch.tensor([4.0, 2.0, 1.0])
+        with self.assertRaisesRegex(ValueError, "requires sigma_schedule"):
+            iem_objective_from_reference_statistics(
+                features,
+                mu_omega,
+                0.0,
+                "negative_log_p_plus_negative_g",
+            )
+        for a1, a2 in ((-1.0, 1.0), (1.0, -1.0), (0.0, 0.0)):
+            with self.subTest(a1=a1, a2=a2):
+                with self.assertRaises(ValueError):
+                    negative_log_p_plus_negative_g_reward(
+                        features,
+                        mu_omega,
+                        schedule,
+                        signal_dimension=2,
+                        a1=a1,
+                        a2=a2,
+                    )
 
     def test_cosine_reference_mean_matches_direct_pairwise_average(self):
         references = torch.nn.functional.normalize(
@@ -742,6 +853,93 @@ class IEMRewardFlowTests(unittest.TestCase):
                 accelerator=MockAccelerator(),
                 config=SimpleNamespace(**iem_values),
             )
+
+    def test_density_objective_config_and_checkpoint_compatibility(self):
+        class MockAccelerator:
+            device = torch.device("cpu")
+            num_processes = 1
+
+        values = {
+            "distance_metric": "iem",
+            "iem_objective": "negative_log_p_plus_negative_g",
+            "density_a1": 0.25,
+            "density_a2": 1.75,
+            "reference_prompt_mode": "same_prompt",
+            "reference_samples_per_prompt": 2,
+            "reference_batch_size": 1,
+            "feature_batch_size": 1,
+            "reference_selection_mode": "all",
+            "nearest_reference_fraction": 0.1,
+            "sigma_min": 1.0,
+            "sigma_max": 4.0,
+            "num_steps": 2,
+            "level_batch_size": 1,
+            "noise_table_count": 1,
+        }
+        reward = IEMReward(
+            pipe=None,
+            model=None,
+            accelerator=MockAccelerator(),
+            config=SimpleNamespace(**values),
+        )
+        self.assertEqual(reward.reward_log_name, "NegativeLogPPlusNegativeG")
+        features = torch.tensor(
+            [[1.0, -2.0, 0.5, 0.5], [-0.5, 1.0, 2.0, -1.5]]
+        )
+        mu_omega = torch.tensor([0.25, -0.5, 1.5, 0.75])
+        torch.testing.assert_close(
+            reward._iem_objective_scores(features, mu_omega, 0.0, (2,)),
+            negative_log_p_plus_negative_g_reward(
+                features,
+                mu_omega,
+                reward.sigma_schedule,
+                signal_dimension=2,
+                a1=0.25,
+                a2=1.75,
+            ),
+        )
+        state = reward.state_dict()
+        self.assertEqual(state["density_a1"], 0.25)
+        self.assertEqual(state["density_a2"], 1.75)
+        reward.load_state_dict(state)
+
+        with self.assertRaisesRegex(ValueError, "density_a1"):
+            reward.load_state_dict(dict(state, density_a1=1.0))
+        with self.assertRaisesRegex(ValueError, "reference_selection_mode"):
+            IEMReward(
+                pipe=None,
+                model=None,
+                accelerator=MockAccelerator(),
+                config=SimpleNamespace(
+                    **dict(values, reference_selection_mode="nearest")
+                ),
+            )
+        for overrides in (
+            {"density_a1": -1.0},
+            {"density_a2": float("inf")},
+            {"density_a1": 0.0, "density_a2": 0.0},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    IEMReward(
+                        pipe=None,
+                        model=None,
+                        accelerator=MockAccelerator(),
+                        config=SimpleNamespace(**dict(values, **overrides)),
+                    )
+
+        default_reward = IEMReward(
+            pipe=None,
+            model=None,
+            accelerator=MockAccelerator(),
+            config=SimpleNamespace(
+                **dict(values, density_a1=1.0, density_a2=1.0)
+            ),
+        )
+        legacy_state = default_reward.state_dict()
+        legacy_state.pop("density_a1")
+        legacy_state.pop("density_a2")
+        default_reward.load_state_dict(legacy_state)
 
     def test_same_prompt_references_use_independent_noises_and_no_reservoir(self):
         class MockAccelerator:

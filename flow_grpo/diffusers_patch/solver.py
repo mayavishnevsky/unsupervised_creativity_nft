@@ -18,6 +18,7 @@ def run_sampling(
     solver="flow",
     determistic=False,
     eta=0.7,
+    denoiser_step_callback=None,
 ):
     assert solver in ["flow", "dance", "ddim", "dpm1", "dpm2"]
     dtype = z.dtype
@@ -34,6 +35,8 @@ def run_sampling(
     ):
         sigma = sigma_schedule[i]
 
+        if denoiser_step_callback is not None:
+            denoiser_step_callback(i)
         pred = v_pred_fn(z.to(dtype), sigma)
         if solver == "flow":
             z, pred_original, log_prob = flow_grpo_step(

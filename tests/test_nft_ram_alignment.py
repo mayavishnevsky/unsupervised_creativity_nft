@@ -60,6 +60,7 @@ def creativity_config(prompt_file: Path, cache_dir: Path, spec_sha256: str):
         dino_model_id="facebook/dinov2-base",
         reference_cache_dir=str(cache_dir),
         reference_cache_spec_sha256=spec_sha256,
+        reference_cache_use_iem_statistics=True,
     )
 
 
@@ -144,6 +145,25 @@ class NftRamReferenceAlignmentTests(unittest.TestCase):
                     accelerator=MockAccelerator(),
                     config=incompatible,
                 )
+
+            latent_only = creativity_config(prompt_file, root, spec_sha256)
+            latent_only.sigma_max = 500.0
+            latent_only.reference_cache_use_iem_statistics = False
+            latent_only_reward = IEMReward(
+                pipe=None,
+                model=None,
+                accelerator=MockAccelerator(),
+                config=latent_only,
+            )
+            self.assertIsNone(
+                latent_only_reward._cached_iem_statistics(
+                    epoch=3,
+                    prompt=prompt,
+                    noise_seed=123,
+                    noise_sha256="ab" * 32,
+                    feature_dimension=4,
+                )
+            )
 
 
 

@@ -19,6 +19,7 @@ def run_sampling(
     determistic=False,
     eta=0.7,
     denoiser_step_callback=None,
+    evaluation_renoising=None,
 ):
     assert solver in ["flow", "dance", "ddim", "dpm1", "dpm2"]
     dtype = z.dtype
@@ -28,46 +29,88 @@ def run_sampling(
     if "dpm" in solver:
         order = int(solver[-1])
         dpm_state = DPMState(order=order)
+    if evaluation_renoising is not None:
+        if not determistic:
+            raise ValueError("evaluation re-noising requires deterministic sampling")
+        evaluation_renoising.validate_step_count(len(sigma_schedule) - 1)
+
+    def take_step(current_z, prediction, step_index):
+        if solver == "flow":
+            return flow_grpo_step(
+                model_output=prediction.float(),
+                latents=current_z.float(),
+                eta=eta if not determistic else 0,
+                sigmas=sigma_schedule,
+                index=step_index,
+                prev_sample=None,
+            )
+        if solver == "dance":
+            return dance_grpo_step(
+                prediction.float(),
+                current_z.float(),
+                eta if not determistic else 0,
+                sigma_schedule,
+                index=step_index,
+                prev_sample=None,
+            )
+        if solver == "ddim":
+            return ddim_step(
+                prediction.float(),
+                current_z.float(),
+                eta if not determistic else 0,
+                sigma_schedule,
+                index=step_index,
+                prev_sample=None,
+            )
+        if "dpm" in solver:
+            assert determistic
+            return dpm_step(
+                order,
+                model_output=prediction.float(),
+                sample=current_z.float(),
+                step_index=step_index,
+                timesteps=sigma_schedule[:-1],
+                sigmas=sigma_schedule,
+                dpm_state=dpm_state,
+            )
+        raise AssertionError(f"unsupported solver: {solver}")
+
     for i in tqdm(
         range(len(sigma_schedule) - 1),
         desc="Sampling Progress",
         disable=not dist.is_initialized() or dist.get_rank() != 0,
     ):
         sigma = sigma_schedule[i]
+        renoising_active = (
+            evaluation_renoising is not None
+            and evaluation_renoising.is_active(i)
+        )
+        dpm_state_before_step = (
+            dpm_state.snapshot() if renoising_active and "dpm" in solver else None
+        )
 
         if denoiser_step_callback is not None:
             denoiser_step_callback(i)
         pred = v_pred_fn(z.to(dtype), sigma)
-        if solver == "flow":
-            z, pred_original, log_prob = flow_grpo_step(
-                model_output=pred.float(),
-                latents=z.float(),
-                eta=eta if not determistic else 0,
-                sigmas=sigma_schedule,
-                index=i,
-                prev_sample=None,
-            )
-        elif solver == "dance":
-            z, pred_original, log_prob = dance_grpo_step(
-                pred.float(), z.float(), eta if not determistic else 0, sigmas=sigma_schedule, index=i, prev_sample=None
-            )
-        elif solver == "ddim":
-            z, pred_original, log_prob = ddim_step(
-                pred.float(), z.float(), eta if not determistic else 0, sigmas=sigma_schedule, index=i, prev_sample=None
-            )
-        elif "dpm" in solver:
-            assert determistic
-            z, pred_original, log_prob = dpm_step(
-                order,
-                model_output=pred.float(),
-                sample=z.float(),
-                step_index=i,
-                timesteps=sigma_schedule[:-1],
-                sigmas=sigma_schedule,
-                dpm_state=dpm_state,
-            )
-        else:
-            assert False
+        z, pred_original, log_prob = take_step(z, pred, i)
+
+        if renoising_active:
+            for repeat_index in range(evaluation_renoising.repeats):
+                z = evaluation_renoising.renoise(
+                    z.to(dtype),
+                    sigma_schedule[i],
+                    sigma_schedule[i + 1],
+                    i,
+                    repeat_index,
+                )
+                pred = v_pred_fn(z.to(dtype), sigma)
+                if "dpm" in solver:
+                    # This is still timestep i: discard the previous attempt,
+                    # restore history through i-1, and retain only the final
+                    # repeated prediction as history for timestep i+1.
+                    dpm_state.restore(dpm_state_before_step)
+                z, pred_original, log_prob = take_step(z, pred, i)
+
         z = z.to(dtype)
         all_latents.append(z)
         all_log_probs.append(log_prob)
@@ -205,6 +248,18 @@ class DPMState:
     def update_lower_order(self):
         if self.lower_order_nums < self.order:
             self.lower_order_nums += 1
+
+    def snapshot(self):
+        """Capture the history before one solver step."""
+
+        return tuple(self.model_outputs), self.lower_order_nums
+
+    def restore(self, snapshot):
+        """Restore history before repeating the same timestep."""
+
+        model_outputs, lower_order_nums = snapshot
+        self.model_outputs[:] = model_outputs
+        self.lower_order_nums = lower_order_nums
 
 
 def dpm_step(

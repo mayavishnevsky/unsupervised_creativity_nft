@@ -20,6 +20,7 @@ from PIL import Image
 from flow_grpo.adapter_schedule import linear_decay_strengths
 from flow_grpo.baseline_lora import merge_frozen_baseline_lora
 from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
+from flow_grpo.evaluation_renoising import RENOISING_SEED_DOMAIN
 from flow_grpo.nft_creativity_runtime import (
     resolve_checkpoint,
     validation_prompt_seeds,
@@ -98,6 +99,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--base-seed", type=int, default=0)
     parser.add_argument("--seeds-per-prompt", type=int, default=1)
+    parser.add_argument(
+        "--renoising-repeats",
+        type=int,
+        default=0,
+        help=(
+            "Additional re-noise/denoise passes after each step where the "
+            "trained NFT LoRA has nonzero strength. Evaluation only."
+        ),
+    )
     parser.add_argument(
         "--adapter-full-strength-steps",
         type=int,
@@ -288,6 +298,8 @@ def main() -> None:
     config.validation.base_seed = int(args.base_seed)
     if args.seeds_per_prompt <= 0:
         raise ValueError("--seeds-per-prompt must be positive")
+    if args.renoising_repeats < 0:
+        raise ValueError("--renoising-repeats must be nonnegative")
     # EMA is applied directly below, before both rendering calls.
     config.train.ema = False
     if (args.adapter_full_strength_steps is None) != (
@@ -403,6 +415,15 @@ def main() -> None:
         "adapter_schedules": schedule_manifests,
         "seeds_per_prompt": int(args.seeds_per_prompt),
         "prompt_seed_groups": prompt_seed_groups,
+        "evaluation_renoising": (
+            {
+                "additional_passes_per_active_step": args.renoising_repeats,
+                "active_when": "trained NFT LoRA strength is greater than zero",
+                "seed_domain": RENOISING_SEED_DOMAIN,
+            }
+            if args.renoising_repeats
+            else None
+        ),
         "samples": [
             {
                 "index": prompt_index * args.seeds_per_prompt + seed_index,
@@ -430,8 +451,11 @@ def main() -> None:
             mode=args.wandb_mode,
             dir=os.environ.get("WANDB_DIR", "/tmp/wandb"),
         )
+        config_key = "creative_probe_8seed_creative15"
+        if args.renoising_repeats:
+            config_key += f"_renoise{args.renoising_repeats}x"
         wandb.config.update(
-            {"creative_probe_8seed_creative15": manifest},
+            {config_key: manifest},
             allow_val_change=True,
         )
     else:
@@ -467,6 +491,11 @@ def main() -> None:
     if schedule_specs:
         manifest["prompt_grids"] = {}
         for label, full_steps, zero_steps in schedule_specs:
+            output_label = (
+                f"{label}_renoise{args.renoising_repeats}x"
+                if args.renoising_repeats
+                else label
+            )
             creative_records = render_fixed_validation(
                 pipeline,
                 encode_prompts,
@@ -477,16 +506,17 @@ def main() -> None:
                 global_step=global_step,
                 ema=None,
                 trainable_parameters=[],
-                label=f"creative_probes_final_epoch_{epoch_label}_{label}",
+                label=f"creative_probes_final_epoch_{epoch_label}_{output_label}",
                 baseline=False,
                 adapter_full_strength_steps=full_steps,
                 adapter_zero_strength_steps=zero_steps,
                 seeds_per_prompt=args.seeds_per_prompt,
                 wandb_log=False,
+                renoising_repeats=args.renoising_repeats,
             )
-            manifest["prompt_grids"][label] = _log_paired_prompt_grids(
+            manifest["prompt_grids"][output_label] = _log_paired_prompt_grids(
                 output_dir=output_dir,
-                label=label,
+                label=output_label,
                 prompts=prompts,
                 baseline_records=baseline_records,
                 creative_records=creative_records,
@@ -496,6 +526,8 @@ def main() -> None:
         with (output_dir / "manifest.json").open("w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2)
     else:
+        if args.renoising_repeats:
+            schedule_suffix += f"_renoise{args.renoising_repeats}x"
         render_fixed_validation(
             pipeline,
             encode_prompts,
@@ -510,6 +542,7 @@ def main() -> None:
             baseline=False,
             adapter_full_strength_steps=args.adapter_full_strength_steps,
             adapter_zero_strength_steps=args.adapter_zero_strength_steps,
+            renoising_repeats=args.renoising_repeats,
         )
     wandb.finish()
 

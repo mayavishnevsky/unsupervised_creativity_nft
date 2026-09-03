@@ -14,6 +14,7 @@ from PIL import Image
 
 from flow_grpo.adapter_schedule import LoraAdapterScaler, linear_decay_strengths
 from flow_grpo.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
+from flow_grpo.evaluation_renoising import EvaluationRenoising
 from flow_grpo.nft_creativity_runtime import validation_prompt_seeds, validation_prompts
 
 
@@ -35,6 +36,7 @@ def render_fixed_validation(
     adapter_zero_strength_steps: int | None = None,
     seeds_per_prompt: int = 1,
     wandb_log: bool = True,
+    renoising_repeats: int = 0,
 ):
     """Render fixed prompt/latent pairs and log a separate W&B panel."""
 
@@ -45,6 +47,17 @@ def render_fixed_validation(
         )
     if baseline and adapter_full_strength_steps is not None:
         raise ValueError("baseline validation cannot use an adapter strength schedule")
+    if (
+        isinstance(renoising_repeats, bool)
+        or int(renoising_repeats) != renoising_repeats
+        or renoising_repeats < 0
+    ):
+        raise ValueError("renoising_repeats must be a nonnegative integer")
+    renoising_repeats = int(renoising_repeats)
+    if baseline and renoising_repeats:
+        raise ValueError("baseline validation cannot use re-noising")
+    if renoising_repeats and not bool(config.sample.deterministic):
+        raise ValueError("evaluation re-noising requires deterministic sampling")
     seeds_per_prompt = int(seeds_per_prompt)
     if seeds_per_prompt <= 0:
         raise ValueError("seeds_per_prompt must be positive")
@@ -133,6 +146,18 @@ def render_fixed_validation(
                         for case in batch_cases
                     ]
                 )
+                evaluation_renoising = None
+                if renoising_repeats:
+                    active_steps = (
+                        tuple(strength > 0.0 for strength in adapter_strengths)
+                        if adapter_strengths is not None
+                        else (True,) * int(config.sample.eval_num_steps)
+                    )
+                    evaluation_renoising = EvaluationRenoising(
+                        sample_seeds=tuple(case["seed"] for case in batch_cases),
+                        active_steps=active_steps,
+                        repeats=renoising_repeats,
+                    )
                 with torch.autocast(
                     device_type="cuda",
                     enabled=config.mixed_precision in ("fp16", "bf16"),
@@ -159,6 +184,7 @@ def render_fixed_validation(
                                 adapter_strengths[step_index]
                             )
                         ),
+                        evaluation_renoising=evaluation_renoising,
                     )
                 for case, image in zip(batch_cases, images, strict=True):
                     index = case["index"]

@@ -184,6 +184,27 @@ def sd3_iem_same_prompt_partiprompts():
     config.sample.ram_aligned_prompt_sampling = False
 
     config.beta = 0.1
+
+    # Candidate-only inference-time diversity. References, validation, and
+    # creative probes always retain ordinary baseline sampling.
+    config.candidate_diversity = candidate_diversity = (
+        ml_collections.ConfigDict()
+    )
+    candidate_diversity.method = "none"
+    candidate_diversity.cads = cads = ml_collections.ConfigDict()
+    cads.tau1 = 0.6
+    cads.tau2 = 0.9
+    cads.noise_scale = 0.25
+    cads.psi = 0.5
+    cads.rescale = True
+    candidate_diversity.contextual_repulsion = contextual = (
+        ml_collections.ConfigDict()
+    )
+    contextual.target_tensor = "text"
+    contextual.t_stop = 4
+    contextual.num_steps = 100
+    contextual.eta = 6.0e5
+    contextual.kernel_reg = 1.0e-4
     config.decay_type = 1
     config.train.batch_size = 8
     config.train.gradient_accumulation_steps = 72

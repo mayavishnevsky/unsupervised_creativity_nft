@@ -51,6 +51,8 @@ def pipeline_with_logprob(
     solver: str = "flow",
     model_type: str = "sd3",
     denoiser_step_callback=None,
+    conditioning_step_callback=None,
+    evaluation_renoising=None,
 ):
     height = height or self.default_sample_size * self.vae_scale_factor
     width = width or self.default_sample_size * self.vae_scale_factor
@@ -208,6 +210,26 @@ def pipeline_with_logprob(
     sigmas = self.scheduler.sigmas.float()
 
     def v_pred_fn(z, sigma):
+        step_prompt_embeds = prompt_embeds
+        step_pooled_prompt_embeds = pooled_prompt_embeds
+        if conditioning_step_callback is not None:
+            if flux:
+                raise ValueError(
+                    "conditioning_step_callback currently supports SD3 only"
+                )
+            (
+                step_prompt_embeds,
+                step_pooled_prompt_embeds,
+            ) = conditioning_step_callback(float(sigma.item()))
+            if step_prompt_embeds.shape != prompt_embeds.shape:
+                raise ValueError(
+                    "conditioning_step_callback changed prompt embedding shape"
+                )
+            if step_pooled_prompt_embeds.shape != pooled_prompt_embeds.shape:
+                raise ValueError(
+                    "conditioning_step_callback changed pooled embedding shape"
+                )
+
         if not flux:
             latent_model_input = torch.cat([z] * 2) if self.do_classifier_free_guidance else z
             # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
@@ -215,12 +237,12 @@ def pipeline_with_logprob(
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timesteps,
-                encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_prompt_embeds,
+                encoder_hidden_states=step_prompt_embeds,
+                pooled_projections=step_pooled_prompt_embeds,
                 joint_attention_kwargs=self.joint_attention_kwargs,
                 return_dict=False,
             )[0]
-            noise_pred = noise_pred.to(prompt_embeds.dtype)
+            noise_pred = noise_pred.to(step_prompt_embeds.dtype)
             # perform guidance
             if self.do_classifier_free_guidance:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -260,6 +282,7 @@ def pipeline_with_logprob(
         deterministic,
         noise_level,
         denoiser_step_callback=denoiser_step_callback,
+        evaluation_renoising=evaluation_renoising,
     )
 
     if output_type == "latent":

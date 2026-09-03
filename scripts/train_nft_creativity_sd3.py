@@ -36,6 +36,12 @@ import random
 from torch.utils.data import Dataset, DataLoader
 from flow_grpo.ema import EMAModuleWrapper
 from flow_grpo.baseline_lora import merge_frozen_baseline_lora, validate_no_cfg
+from flow_grpo.candidate_diversity import (
+    candidate_diversity_controls,
+    candidate_diversity_seed,
+    make_generator as make_diversity_generator,
+    validate_candidate_diversity_sampling,
+)
 from flow_grpo.creativity import (
     BalancedPromptSampler,
     TorchDistributedContext,
@@ -188,6 +194,10 @@ def calculate_zero_std_ratio(prompts, gathered_rewards):
 
 def main(_):
     config = FLAGS.config
+    diversity_method, diversity_config = validate_candidate_diversity_sampling(
+        config
+    )
+    logger.info("Candidate diversity method: %s", diversity_method)
 
     # --- Distributed Setup ---
     rank = int(os.environ["RANK"])
@@ -501,7 +511,7 @@ def main(_):
         candidate_prompts = []
         sampling_start = synchronized_time(device)
 
-        for _ in tqdm(
+        for sample_batch_index in tqdm(
             range(config.sample.num_batches_per_epoch),
             desc=f"Epoch {epoch}: sampling",
             disable=not is_main_process(rank),
@@ -518,24 +528,51 @@ def main(_):
                 return_tensors="pt",
             ).input_ids.to(device)
 
+            diversity_generator = None
+            if diversity_method == "cads":
+                diversity_generator = make_diversity_generator(
+                    device,
+                    candidate_diversity_seed(
+                        config.seed,
+                        epoch,
+                        rank,
+                        sample_batch_index * config.sample.train_batch_size,
+                    ),
+                )
+
             transformer_ddp.module.set_adapter("old")
-            with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
-                with torch.no_grad():
-                    latent_endpoints, _, _ = pipeline_with_logprob(
-                        pipeline,
-                        prompt_embeds=prompt_embeds,
-                        pooled_prompt_embeds=pooled_prompt_embeds,
-                        num_inference_steps=config.sample.num_steps,
-                        guidance_scale=config.sample.guidance_scale,
-                        output_type="latent",
-                        height=config.resolution,
-                        width=config.resolution,
-                        noise_level=config.sample.noise_level,
-                        deterministic=config.sample.deterministic,
-                        solver=config.sample.solver,
-                        model_type="sd3",
-                    )
-            transformer_ddp.module.set_adapter("default")
+            try:
+                with candidate_diversity_controls(
+                    pipeline,
+                    diversity_method,
+                    diversity_config,
+                    prompt_embeds,
+                    pooled_prompt_embeds,
+                    prompts,
+                    diversity_generator,
+                ) as diversity_kwargs:
+                    with torch_autocast(
+                        enabled=enable_amp,
+                        dtype=mixed_precision_dtype,
+                    ):
+                        with torch.no_grad():
+                            latent_endpoints, _, _ = pipeline_with_logprob(
+                                pipeline,
+                                prompt_embeds=prompt_embeds,
+                                pooled_prompt_embeds=pooled_prompt_embeds,
+                                num_inference_steps=config.sample.num_steps,
+                                guidance_scale=config.sample.guidance_scale,
+                                output_type="latent",
+                                height=config.resolution,
+                                width=config.resolution,
+                                noise_level=config.sample.noise_level,
+                                deterministic=config.sample.deterministic,
+                                solver=config.sample.solver,
+                                model_type="sd3",
+                                **diversity_kwargs,
+                            )
+            finally:
+                transformer_ddp.module.set_adapter("default")
             timesteps = pipeline.scheduler.timesteps.repeat(len(prompts), 1).to(device)
             samples_data_list.append(
                 {

@@ -177,6 +177,25 @@ the frozen baseline and is never scaled. Both flags must be supplied together.
 Omitting them preserves the original all-steps NFT adapter behavior. The
 manifest records the complete strength vector.
 
+Creative probes also support evaluation-only repeated re-noising:
+
+```bash
+python scripts/evaluate_nft_creative_probes.py ... \
+  --schedule creative15:15:25 \
+  --renoising-repeats 5
+```
+
+The ordinary denoising update is followed by five additional transitions only
+while the trained NFT LoRA strength is greater than zero. Each transition
+moves the new lower-noise latent back to the current FlowMatch sigma with an
+independent, sample-seeded Gaussian draw, evaluates the denoiser again at the
+same sigma, and advances to the same next sigma. For DPM2, solver history is
+restored to its pre-step state before every repeated transition; only the final
+prediction at that timestep is retained for the next timestep. Re-noising
+requires deterministic evaluation, is rejected for baseline renders, and is
+disabled by default. Training sampling and in-training validation do not pass
+this option and therefore retain their exact prior path.
+
 Every completed epoch is checkpointed atomically before evaluation
 (`flow_grpo/nft_creativity_runtime.py:162`). A checkpoint includes both NFT
 adapters, optimizer, scaler, EMA, global step, next epoch, all per-rank Python /
@@ -331,3 +350,36 @@ RAM-aligned cached IEM statistics can be reused only when their schedule and
 noise seed/hash match. Checkpoints store the coefficients only for this mode
 and reject resume-time coefficient changes; absent fields use the documented
 defaults of 1.
+
+## Candidate-only inference-time diversity
+
+The RAM-compatible NFT trainer supports two opt-in candidate samplers through
+`config.candidate_diversity.method`: `cads` and `contextual_repulsion`. The
+default is `none`, which retains the original NFT sampling path.
+
+The diversity context surrounds only the policy candidate call in
+`scripts/train_nft_creativity_sd3.py`. Reference generation in
+`CreativityReward`, fixed validation, and creative probes never receive the
+CADS conditioning callback or contextual attention wrappers. The clean prompt
+embeddings are still saved with the candidate and used for reward conditioning
+and NFT optimization.
+
+CADS corrupts the sequence and pooled prompt embeddings independently at each
+SD3 flow timestep. Its dedicated generator is seeded by the global seed,
+epoch, rank, and candidate-batch offset, so CADS noise does not advance the
+latent or stochastic-solver RNG streams. Contextual repulsion temporarily
+wraps the frozen rollout adapter's attention processors and restores the exact
+original processor objects in a `finally` block.
+
+Contextual repulsion is a joint candidate-group objective. It therefore
+requires:
+
+```python
+config.sample.train_batch_size = config.sample.num_image_per_prompt
+```
+
+For the standard 24-candidate, 48-group, two-GPU experiment, set the sampling
+batch size to 24 and the number of sampling batches per epoch to 24. This keeps
+the global epoch size at 1,152 candidates. Both modes require the CFG-distilled
+baseline's normal `sample.guidance_scale = 1.0`; incompatible configurations
+fail before distributed initialization or model loading.

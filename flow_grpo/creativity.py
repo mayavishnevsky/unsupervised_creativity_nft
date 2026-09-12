@@ -33,6 +33,10 @@ from flow_grpo.reference_cache import (
     LATENT_KEY,
     ReferenceCacheReader,
 )
+from flow_grpo.reference_model_schedule import (
+    ReferenceModelUpdatePolicy,
+    reference_adapter_context,
+)
 
 
 Tensor = torch.Tensor
@@ -914,7 +918,7 @@ def mean_nearest_l2_distance(
 
 
 class ReferenceReservoir:
-    """Bounded priority reservoir of base-model latents and prompt identities."""
+    """Bounded priority reservoir of reference-model latents and prompt IDs."""
 
     latent_dtype = torch.bfloat16
 
@@ -929,6 +933,11 @@ class ReferenceReservoir:
 
     def __len__(self) -> int:
         return 0 if self.latents is None else self.latents.shape[0]
+
+    def clear(self) -> None:
+        """Discard endpoints produced by an obsolete reference snapshot."""
+
+        self.latents = self.prompt_ids = self.priorities = None
 
     def update(self, latents: Tensor, prompt_ids: Tensor, seed: int) -> None:
         latents = torch.as_tensor(latents).detach().to(device="cpu", dtype=self.latent_dtype)
@@ -999,7 +1008,7 @@ class ReferenceReservoir:
 
 
 class IEMReward:
-    """Stateful reference-distance reward backed by frozen-base samples."""
+    """Stateful reference-distance reward backed by a frozen reference model."""
 
     def __init__(
         self,
@@ -1008,11 +1017,16 @@ class IEMReward:
         accelerator,
         config,
         reference_latent_generator: Callable[..., Tensor] | None = None,
+        reference_adapter_name: str | None = None,
     ):
         self.pipe = pipe
         self.model = model
         self.accelerator = accelerator
         self.config = config
+        self.reference_adapter_name = reference_adapter_name
+        self.reference_model_update = ReferenceModelUpdatePolicy.from_config(
+            config
+        )
         self.reference_latent_generator = reference_latent_generator
         self.distance_metric = str(
             getattr(config, "distance_metric", "iem")
@@ -1188,6 +1202,15 @@ class IEMReward:
             model_field = IMAGE_DISTANCE_MODEL_FIELDS[self.distance_metric]
             if not str(getattr(self.config, model_field, "")):
                 raise ValueError(f"creativity.{model_field} must be nonempty")
+        if (
+            self.reference_model_update.adapter_name
+            != self.reference_adapter_name
+        ):
+            raise ValueError(
+                "the rolling reference-model adapter does not match "
+                "creativity.reference_model_update.enabled"
+            )
+
 
     def _validate_reference_cache(self) -> None:
         """Reject cached references generated with incompatible RAM inputs."""
@@ -1270,6 +1293,15 @@ class IEMReward:
                 f"config: {mismatches}"
             )
 
+    def _reference_cache_active(self, epoch: int) -> bool:
+        update_policy = getattr(
+            self, "reference_model_update", ReferenceModelUpdatePolicy()
+        )
+        return (
+            self.reference_cache is not None
+            and update_policy.cache_allowed(epoch)
+        )
+
     def _cached_references(
         self,
         *,
@@ -1277,7 +1309,7 @@ class IEMReward:
         prompt: str,
         tensor_keys: Sequence[str],
     ) -> dict[str, Tensor] | None:
-        if self.reference_cache is None:
+        if not self._reference_cache_active(epoch):
             return None
         if not self.reference_cache.has_entry(epoch=epoch, prompt=prompt):
             return None
@@ -1305,7 +1337,7 @@ class IEMReward:
     ) -> tuple[Tensor, Tensor] | None:
         """Load statistics only when they match the candidate's exact noise."""
         if (
-            self.reference_cache is None
+            not self._reference_cache_active(epoch)
             or self.reference_selection_mode != "all"
             or not self.reference_cache_use_iem_statistics
         ):
@@ -1339,7 +1371,6 @@ class IEMReward:
             variance.to(self.accelerator.device, dtype=torch.float64),
         )
 
-
     @staticmethod
     def _adapter_host(model):
         if hasattr(model, "disable_adapter"):
@@ -1347,6 +1378,18 @@ class IEMReward:
         if hasattr(model, "module") and hasattr(model.module, "disable_adapter"):
             return model.module
         raise AttributeError("IEM transformer does not expose PEFT adapter controls")
+
+    def _reference_model(self):
+        return reference_adapter_context(
+            self._adapter_host(self.model),
+            self.reference_adapter_name,
+        )
+
+    def on_reference_model_updated(self) -> None:
+        """Invalidate state containing endpoints from the previous snapshot."""
+
+        if self.reservoir is not None:
+            self.reservoir.clear()
 
     def state_dict(self) -> dict:
         if self.reference_prompt_mode == "diverse":
@@ -1610,7 +1653,6 @@ class IEMReward:
             excluded_prompts=excluded_prompts,
         )
         local_records = records[self.accelerator.process_index :: self.accelerator.num_processes]
-        host = self._adapter_host(self.model)
         local_latents = []
         batch_size = int(self.config.reference_batch_size)
         generator = torch.Generator(device=self.accelerator.device).manual_seed(
@@ -1619,7 +1661,7 @@ class IEMReward:
             + int(epoch) * self.accelerator.num_processes
             + self.accelerator.process_index
         )
-        with host.disable_adapter():
+        with self._reference_model():
             for start in range(0, len(local_records), batch_size):
                 prompts = [record.text for record in local_records[start : start + batch_size]]
                 with self.accelerator.autocast():
@@ -1881,7 +1923,6 @@ class IEMReward:
             device=self.accelerator.device,
             dtype=torch.float32,
         )
-        host = self._adapter_host(self.model)
         references_per_prompt = int(self.config.reference_samples_per_prompt)
         reference_batch_size = int(self.config.reference_batch_size)
         reference_generation_seconds = 0.0
@@ -1890,9 +1931,10 @@ class IEMReward:
         candidate_features_seconds = 0.0
         reference_selection_seconds = 0.0
         selected_reference_count = references_per_prompt
+        cache_active = self._reference_cache_active(epoch)
 
         try:
-            with host.disable_adapter():
+            with self._reference_model():
                 for group_index, prompt in enumerate(group_prompts):
                     candidate_start = group_index * int(group_size)
                     candidate_stop = candidate_start + int(group_size)
@@ -2138,12 +2180,12 @@ class IEMReward:
             f"{prefix}_reference_subset_size": float(references_per_prompt),
             f"{prefix}_same_prompt_reference_groups": float(global_group_count),
             f"{prefix}_same_prompt_references_generated": float(
-                0 if self.reference_cache is not None
+                0 if cache_active
                 else global_group_count * references_per_prompt
             ),
             f"{prefix}_same_prompt_references_loaded": float(
                 global_group_count * references_per_prompt
-                if self.reference_cache is not None else 0
+                if cache_active else 0
             ),
             f"timing/{prefix}_reference_refresh_seconds": (
                 reference_generation_seconds
@@ -2268,7 +2310,6 @@ class IEMReward:
             device=self.accelerator.device,
             dtype=torch.float64,
         )
-        host = self._adapter_host(self.model)
         reference_generation_seconds = 0.0
         reference_cache_load_seconds = 0.0
         reference_statistics_seconds = 0.0
@@ -2276,9 +2317,10 @@ class IEMReward:
         references_per_prompt = int(self.config.reference_samples_per_prompt)
         reference_batch_size = int(self.config.reference_batch_size)
         feature_batch_size = int(self.config.feature_batch_size)
+        cache_active = self._reference_cache_active(epoch)
         group_assignments = assignments[:: int(group_size)]
 
-        with host.disable_adapter():
+        with self._reference_model():
             for table_index in group_assignments.unique().tolist():
                 noise_seed = iem_noise_table_seed(
                     self.config.seed,
@@ -2559,12 +2601,12 @@ class IEMReward:
             ),
             "iem_same_prompt_reference_groups": float(global_group_count),
             "iem_same_prompt_references_generated": float(
-                0 if self.reference_cache is not None
+                0 if cache_active
                 else global_group_count * references_per_prompt
             ),
             "iem_same_prompt_references_loaded": float(
                 global_group_count * references_per_prompt
-                if self.reference_cache is not None else 0
+                if cache_active else 0
             ),
             "timing/iem_reference_refresh_seconds": (
                 reference_generation_seconds
@@ -2695,7 +2737,7 @@ class IEMReward:
         group_size: int,
         reference_excluded_prompts: Sequence[str] | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
-        """Generate frozen-base references and return raw distance rewards."""
+        """Generate frozen-reference samples and return raw distance rewards."""
 
         if self.reference_prompt_mode == "same_prompt":
             score_method = (
@@ -2741,10 +2783,9 @@ class IEMReward:
         assignments = self._noise_table_assignments(len(candidate_latents), int(group_size), epoch)
         scores = torch.empty(len(candidate_latents), device=self.accelerator.device, dtype=torch.float64)
         signal_shape = tuple(candidate_latents.shape[1:])
-        host = self._adapter_host(self.model)
         reference_statistics_seconds = 0.0
         candidate_features_seconds = 0.0
-        with host.disable_adapter():
+        with self._reference_model():
             for table_index in range(int(self.config.noise_table_count)):
                 noise_table = sample_iem_noise_table(
                     self.sigma_schedule,

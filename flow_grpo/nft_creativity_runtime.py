@@ -10,6 +10,7 @@ import random
 import shutil
 import stat
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -145,10 +146,25 @@ def validation_prompts(prompt_files, count: int, seed: int) -> list[str]:
     return [record.text for record in sampler.sample(count, seed)]
 
 
+@dataclass
+class ReferenceModelState:
+    """Mutable epoch marker restored alongside a frozen reference adapter."""
+
+    epoch: int = 0
+
+
 class CreativityRewardSet:
     """Evaluate one or more RAM-compatible creativity distances synchronously."""
 
-    def __init__(self, pipe, model, distributed_context, config, reference_generator):
+    def __init__(
+        self,
+        pipe,
+        model,
+        distributed_context,
+        config,
+        reference_generator,
+        reference_adapter_name=None,
+    ):
         metrics = list(
             getattr(config, "distance_metrics", None)
             or [str(config.distance_metric)]
@@ -171,6 +187,7 @@ class CreativityRewardSet:
                 distributed_context,
                 metric_config,
                 reference_latent_generator=reference_generator,
+                reference_adapter_name=reference_adapter_name,
             )
 
     def score(self, *args, **kwargs):
@@ -198,6 +215,10 @@ class CreativityRewardSet:
             raise ValueError("checkpoint creativity metrics do not match the config")
         for name, reward_state in state.items():
             self.rewards[name].load_state_dict(reward_state)
+
+    def on_reference_model_updated(self) -> None:
+        for reward in self.rewards.values():
+            reward.on_reference_model_updated()
 
 
 def _cpu_adapter_state(model, adapter_name: str) -> dict[str, torch.Tensor]:
@@ -242,8 +263,14 @@ def save_training_checkpoint(
     global_step: int,
     rank: int,
     world_size: int,
+    reference_model_state: ReferenceModelState | None = None,
+    reference_adapter_name: str | None = None,
 ) -> Path | None:
     """Atomically save all state needed to resume at an epoch boundary."""
+    if (reference_model_state is None) != (reference_adapter_name is None):
+        raise ValueError(
+            "reference model state and adapter name must be provided together"
+        )
 
     local_rng = _rng_state()
     rng_states = [None] * world_size if rank == 0 else None
@@ -278,6 +305,14 @@ def save_training_checkpoint(
                 "creativity": creativity_rewards.state_dict(),
                 "rng_states": rng_states,
             }
+            if reference_model_state is not None:
+                payload["reference_model"] = {
+                    "epoch": int(reference_model_state.epoch),
+                    "adapter": _cpu_adapter_state(
+                        model,
+                        reference_adapter_name,
+                    ),
+                }
             torch.save(payload, staging / "training_state.pt")
             model.save_pretrained(
                 staging / "lora",
@@ -324,7 +359,13 @@ def load_training_checkpoint(
     *,
     device,
     rank: int,
+    reference_model_state: ReferenceModelState | None = None,
+    reference_adapter_name: str | None = None,
 ) -> tuple[int, int, Path]:
+    if (reference_model_state is None) != (reference_adapter_name is None):
+        raise ValueError(
+            "reference model state and adapter name must be provided together"
+        )
     checkpoint = resolve_checkpoint(path)
     state = torch.load(
         checkpoint / "training_state.pt",
@@ -334,6 +375,23 @@ def load_training_checkpoint(
     if int(state.get("format_version", -1)) != 1:
         raise ValueError("unsupported NFT creativity checkpoint format")
     set_peft_model_state_dict(model, state["default_adapter"], adapter_name="default")
+    saved_reference_model = state.get("reference_model")
+    if reference_model_state is None:
+        if saved_reference_model is not None:
+            raise ValueError(
+                "checkpoint contains a rolling reference model but config disables it"
+            )
+    else:
+        if saved_reference_model is None:
+            raise ValueError(
+                "checkpoint is missing the configured rolling reference model"
+            )
+        set_peft_model_state_dict(
+            model,
+            saved_reference_model["adapter"],
+            adapter_name=reference_adapter_name,
+        )
+        reference_model_state.epoch = int(saved_reference_model["epoch"])
     set_peft_model_state_dict(model, state["old_adapter"], adapter_name="old")
     optimizer.load_state_dict(state["optimizer"])
     if scaler is not None and state["scaler"] is not None:

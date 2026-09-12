@@ -36,6 +36,8 @@ import random
 from torch.utils.data import Dataset, DataLoader
 from flow_grpo.ema import EMAModuleWrapper
 from flow_grpo.baseline_lora import merge_frozen_baseline_lora, validate_no_cfg
+from flow_grpo.image_reward_runtime import StandardImageRewardSet
+from flow_grpo.ram_baseline import merge_ram_checkpoint_adapter
 from flow_grpo.candidate_diversity import (
     candidate_diversity_controls,
     candidate_diversity_seed,
@@ -47,12 +49,20 @@ from flow_grpo.creativity import (
     TorchDistributedContext,
     synchronized_time,
 )
-from flow_grpo.nft_validation import render_fixed_validation
+from flow_grpo.nft_validation import (
+    log_paired_prompt_grids,
+    render_fixed_validation,
+)
 from flow_grpo.nft_creativity_runtime import (
     CreativityRewardSet,
     DistributedPromptGroupBatchSampler,
+    ReferenceModelState,
     load_training_checkpoint,
     save_training_checkpoint,
+)
+from flow_grpo.reference_model_schedule import (
+    ReferenceModelUpdatePolicy,
+    reference_adapter_context,
 )
 from ml_collections import config_flags
 from torch.cuda.amp import GradScaler, autocast as torch_autocast
@@ -194,6 +204,14 @@ def calculate_zero_std_ratio(prompts, gathered_rewards):
 
 def main(_):
     config = FLAGS.config
+    creativity_enabled = bool(getattr(config.creativity, "enabled", True))
+    reference_model_update = ReferenceModelUpdatePolicy.from_config(
+        config.creativity
+    )
+    if not creativity_enabled and reference_model_update.enabled:
+        raise ValueError("standard image rewards cannot update an IEM reference model")
+    if reference_model_update.enabled and not config.use_lora:
+        raise ValueError("rolling reference updates require LoRA training")
     diversity_method, diversity_config = validate_candidate_diversity_sampling(
         config
     )
@@ -260,6 +278,26 @@ def main(_):
         pipeline.transformer, config.baseline_lora_path
     )
     logger.info("Merged frozen baseline LoRA from %s", baseline_adapter_dir)
+    ram_baseline_checkpoint = getattr(config, "ram_baseline_checkpoint", None)
+    if ram_baseline_checkpoint:
+        if baseline_adapter_dir is not None:
+            raise ValueError(
+                "RAM checkpoint merging and baseline_lora_path cannot both be enabled"
+            )
+        pipeline.transformer, ram_checkpoint = merge_ram_checkpoint_adapter(
+            pipeline.transformer,
+            ram_baseline_checkpoint,
+            adapter_name=str(getattr(config, "ram_baseline_adapter", "evaluation")),
+            rank=int(config.train.lora_rank),
+            alpha=int(config.train.lora_alpha),
+            merge_scale=float(getattr(config, "ram_baseline_merge_scale", 1.0)),
+        )
+        logger.info(
+            "Merged frozen RAM %s adapter from %s at strength %.6g",
+            str(getattr(config, "ram_baseline_adapter", "evaluation")),
+            ram_checkpoint,
+            float(getattr(config, "ram_baseline_merge_scale", 1.0)),
+        )
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
     pipeline.text_encoder_2.requires_grad_(False)
@@ -304,6 +342,11 @@ def main(_):
             transformer.set_adapter("default")
         else:
             transformer = get_peft_model(transformer, transformer_lora_config)
+        if reference_model_update.enabled:
+            transformer.add_adapter(
+                reference_model_update.adapter_name,
+                transformer_lora_config,
+            )
         transformer.add_adapter("old", transformer_lora_config)
         transformer.set_adapter("default")
     pipeline.transformer = transformer
@@ -312,6 +355,19 @@ def main(_):
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer_ddp.module.parameters()))
     transformer_ddp.module.set_adapter("old")
     old_transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer_ddp.module.parameters()))
+    reference_transformer_parameters = None
+    if reference_model_update.enabled:
+        transformer_ddp.module.set_adapter(
+            reference_model_update.adapter_name
+        )
+        reference_transformer_parameters = [
+            parameter
+            for parameter in transformer_ddp.module.parameters()
+            if parameter.requires_grad
+        ]
+        for parameter in reference_transformer_parameters:
+            parameter.data.zero_()
+        transformer_ddp.module.set_adapter("default")
     transformer_ddp.module.set_adapter("default")
 
     if config.allow_tf32:
@@ -424,14 +480,23 @@ def main(_):
         )
         return pipeline_with_logprob(pipeline, *args, **kwargs)[0]
 
-    distributed_context = TorchDistributedContext(device, mixed_precision_dtype)
-    creativity_rewards = CreativityRewardSet(
-        pipeline,
-        transformer_ddp.module,
-        distributed_context,
-        config.creativity,
-        generate_reference_latents,
-    )
+    if creativity_enabled:
+        distributed_context = TorchDistributedContext(device, mixed_precision_dtype)
+        creativity_rewards = CreativityRewardSet(
+            pipeline,
+            transformer_ddp.module,
+            distributed_context,
+            config.creativity,
+            generate_reference_latents,
+            reference_adapter_name=reference_model_update.adapter_name,
+        )
+    else:
+        creativity_rewards = StandardImageRewardSet(
+            pipeline,
+            device,
+            config.reward_fn,
+            decode_batch_size=int(config.reward_decode_batch_size),
+        )
 
     # Train!
     samples_per_epoch = config.sample.train_batch_size * world_size * config.sample.num_batches_per_epoch
@@ -450,6 +515,7 @@ def main(_):
 
     first_epoch = 0
     global_step = 0
+    reference_model_state = ReferenceModelState()
     ema = None
     if config.train.ema:
         ema = EMAModuleWrapper(
@@ -469,8 +535,31 @@ def main(_):
             creativity_rewards,
             device=device,
             rank=rank,
+            reference_model_state=(
+                reference_model_state
+                if reference_model_update.enabled
+                else None
+            ),
+            reference_adapter_name=reference_model_update.adapter_name,
         )
-        logger.info("Resumed from %s at epoch %d", resumed_checkpoint, first_epoch)
+        logger.info(
+            "Resumed from %s at epoch %d",
+            resumed_checkpoint,
+            first_epoch,
+        )
+    if reference_model_update.enabled:
+        expected_reference_epoch = (
+            reference_model_update.expected_reference_epoch(
+                first_epoch,
+                int(config.num_epochs),
+            )
+        )
+        if reference_model_state.epoch != expected_reference_epoch:
+            raise ValueError(
+                "checkpoint reference snapshot is inconsistent with its "
+                f"next epoch: saved={reference_model_state.epoch}, "
+                f"expected={expected_reference_epoch}"
+            )
 
     num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
 
@@ -797,10 +886,12 @@ def main(_):
                             return_dict=False,
                         )[0]
 
-                        with torch.no_grad():  # Reference model part
-                            # For LoRA, disable adapter.
+                        with torch.no_grad():  # Frozen reference-model part
                             if config.use_lora:
-                                with transformer_ddp.module.disable_adapter():
+                                with reference_adapter_context(
+                                    transformer_ddp.module,
+                                    reference_model_update.adapter_name,
+                                ):
                                     ref_forward_prediction = transformer_ddp(
                                         hidden_states=xt,
                                         timestep=train_sample_batch["timesteps"][:, j_idx],
@@ -945,6 +1036,36 @@ def main(_):
                 tgt_param.data.copy_(tgt_param.detach().data * decay + src_param.detach().clone().data * (1.0 - decay))
 
         completed_epoch = epoch + 1
+        reference_model_updated = reference_model_update.should_update(
+            completed_epoch,
+            int(config.num_epochs),
+            reference_model_state.epoch,
+        )
+        if reference_model_updated:
+            with torch.no_grad():
+                for source, target in zip(
+                    transformer_trainable_parameters,
+                    reference_transformer_parameters,
+                    strict=True,
+                ):
+                    target.data.copy_(source.detach().data)
+            reference_model_state.epoch = completed_epoch
+            creativity_rewards.on_reference_model_updated()
+            transformer_ddp.module.set_adapter("default")
+            if world_size > 1:
+                dist.barrier()
+            logger.info(
+                "Updated frozen reference model after epoch %d",
+                completed_epoch,
+            )
+        if reference_model_update.enabled and is_main_process(rank):
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "reference_model/epoch": reference_model_state.epoch,
+                    "reference_model/updated": int(reference_model_updated),
+                }
+            )
         if completed_epoch % int(config.save_freq) == 0 and not config.debug:
             transformer_ddp.module.set_adapter("default")
             checkpoint_path = save_training_checkpoint(
@@ -959,6 +1080,12 @@ def main(_):
                 global_step=global_step,
                 rank=rank,
                 world_size=world_size,
+                reference_model_state=(
+                    reference_model_state
+                    if reference_model_update.enabled
+                    else None
+                ),
+                reference_adapter_name=reference_model_update.adapter_name,
             )
             if is_main_process(rank):
                 logger.info("Saved complete checkpoint to %s", checkpoint_path)
@@ -977,6 +1104,75 @@ def main(_):
                 label=f"epoch_{completed_epoch:04d}",
                 baseline=False,
             )
+
+    probe_config = getattr(config, "creative_probes", None)
+    if (
+        probe_config is not None
+        and bool(getattr(probe_config, "enabled", False))
+        and not config.debug
+    ):
+        saved_prompt_files = list(config.validation.prompt_files)
+        saved_prompt_count = int(config.validation.prompt_count)
+        saved_batch_size = int(config.validation.batch_size)
+        prompt_file = str(probe_config.prompt_file)
+        with open(prompt_file, encoding="utf-8") as handle:
+            prompt_count = sum(bool(line.strip()) for line in handle)
+        try:
+            config.validation.prompt_files = [prompt_file]
+            config.validation.prompt_count = prompt_count
+            config.validation.batch_size = int(probe_config.batch_size)
+            seeds_per_prompt = int(probe_config.seeds_per_prompt)
+            ram_style_grids = bool(
+                getattr(probe_config, "ram_style_paired_grids", False)
+            )
+            baseline_records = render_fixed_validation(
+                pipeline,
+                encode_prompt_batch,
+                config,
+                device,
+                rank,
+                world_size,
+                global_step,
+                ema,
+                transformer_trainable_parameters,
+                label=f"creative_probes_final_baseline_{seeds_per_prompt}seeds",
+                baseline=True,
+                seeds_per_prompt=seeds_per_prompt,
+                wandb_log=not ram_style_grids,
+            )
+            creative_records = render_fixed_validation(
+                pipeline,
+                encode_prompt_batch,
+                config,
+                device,
+                rank,
+                world_size,
+                global_step,
+                ema,
+                transformer_trainable_parameters,
+                label=(
+                    f"creative_probes_final_epoch_{int(config.num_epochs):04d}_"
+                    f"{seeds_per_prompt}seeds"
+                ),
+                baseline=False,
+                seeds_per_prompt=seeds_per_prompt,
+                wandb_log=not ram_style_grids,
+            )
+            if ram_style_grids and is_main_process(rank):
+                log_paired_prompt_grids(
+                    output_dir=os.path.join(
+                        config.save_dir, "validation", "creative_probes_ram_style"
+                    ),
+                    label=f"final_epoch_{int(config.num_epochs):04d}",
+                    baseline_records=baseline_records,
+                    creative_records=creative_records,
+                    seeds_per_prompt=seeds_per_prompt,
+                    global_step=global_step,
+                )
+        finally:
+            config.validation.prompt_files = saved_prompt_files
+            config.validation.prompt_count = saved_prompt_count
+            config.validation.batch_size = saved_batch_size
 
     if is_main_process(rank):
         wandb.finish()

@@ -1,12 +1,15 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 
 from config.nft import (
+    sd3_iem_same_prompt_mixed_no_repeat_cached,
     sd3_iem_same_prompt_partiprompts,
     sd3_iem_same_prompt_partiprompts_ram_aligned,
     sd3_iem_same_prompt_partiprompts_smoke,
@@ -208,6 +211,25 @@ class PromptGroupSamplerTests(unittest.TestCase):
 
 
 class ConfigAndSeedTests(unittest.TestCase):
+    def test_cached_mixed_config_uses_explicit_environment_identity(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "NFT_REFERENCE_CACHE_DIR": "/tmp/reference-cache",
+                "NFT_REFERENCE_CACHE_SPEC_SHA256": "abc123",
+            },
+        ):
+            config = sd3_iem_same_prompt_mixed_no_repeat_cached()
+
+        self.assertEqual(
+            config.creativity.reference_cache_dir,
+            "/tmp/reference-cache",
+        )
+        self.assertEqual(
+            config.creativity.reference_cache_spec_sha256,
+            "abc123",
+        )
+
     def test_full_config_matches_requested_run(self):
         config = sd3_iem_same_prompt_partiprompts()
         self.assertEqual(config.sample.num_steps, 25)

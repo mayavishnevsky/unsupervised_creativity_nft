@@ -27,6 +27,7 @@ from flow_grpo.nft_creativity_runtime import (
     validation_prompts,
 )
 from flow_grpo.nft_validation import render_fixed_validation
+from flow_grpo.ram_baseline import merge_ram_checkpoint_adapter
 
 
 def _load_trainable_lora(model, adapter_dir: Path) -> PeftModel:
@@ -93,7 +94,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--prompt-file", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--baseline-lora", required=True)
+    parser.add_argument(
+        "--baseline-lora",
+        default=None,
+        help=(
+            "Optional frozen baseline LoRA override. When omitted, the baseline "
+            "recorded in the checkpoint's resolved config is reconstructed."
+        ),
+    )
     parser.add_argument("--model", default=None)
     parser.add_argument("--prompt-count", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -138,6 +146,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wandb-run-id",
         help="Append probe media to this existing W&B run instead of creating one.",
+    )
+    parser.add_argument(
+        "--wandb-config-key",
+        default=None,
+        help=(
+            "Optional unique W&B config key for the probe manifest. The legacy "
+            "key is preserved when this is omitted."
+        ),
     )
     parser.add_argument("--wandb-mode", default="online")
     return parser.parse_args()
@@ -290,7 +306,10 @@ def main() -> None:
     with (checkpoint / "resolved_config.json").open(encoding="utf-8") as handle:
         config = ConfigDict(json.load(handle))
     config.pretrained.model = args.model or config.pretrained.model
-    config.baseline_lora_path = str(Path(args.baseline_lora).expanduser().resolve())
+    if args.baseline_lora is not None:
+        config.baseline_lora_path = str(
+            Path(args.baseline_lora).expanduser().resolve()
+        )
     config.save_dir = str(output_dir)
     config.validation.prompt_files = [str(prompt_file)]
     config.validation.prompt_count = args.prompt_count or _nonempty_line_count(prompt_file)
@@ -353,8 +372,27 @@ def main() -> None:
     )
     pipeline.transformer, baseline_adapter_dir = merge_frozen_baseline_lora(
         pipeline.transformer,
-        config.baseline_lora_path,
+        getattr(config, "baseline_lora_path", None),
     )
+    ram_baseline_checkpoint = getattr(config, "ram_baseline_checkpoint", None)
+    merged_ram_checkpoint = None
+    if ram_baseline_checkpoint:
+        if baseline_adapter_dir is not None:
+            raise ValueError(
+                "RAM checkpoint merging and baseline_lora_path cannot both be enabled"
+            )
+        pipeline.transformer, merged_ram_checkpoint = merge_ram_checkpoint_adapter(
+            pipeline.transformer,
+            ram_baseline_checkpoint,
+            adapter_name=str(
+                getattr(config, "ram_baseline_adapter", "evaluation")
+            ),
+            rank=int(config.train.lora_rank),
+            alpha=int(config.train.lora_alpha),
+            merge_scale=float(
+                getattr(config, "ram_baseline_merge_scale", 1.0)
+            ),
+        )
     pipeline.transformer = _load_trainable_lora(
         pipeline.transformer,
         checkpoint / "lora",
@@ -402,7 +440,24 @@ def main() -> None:
     ]
     manifest = {
         "checkpoint": str(checkpoint),
-        "baseline_lora": str(baseline_adapter_dir),
+        "baseline_lora": (
+            str(baseline_adapter_dir) if baseline_adapter_dir is not None else None
+        ),
+        "ram_baseline_checkpoint": (
+            str(merged_ram_checkpoint)
+            if merged_ram_checkpoint is not None
+            else None
+        ),
+        "ram_baseline_adapter": (
+            str(getattr(config, "ram_baseline_adapter", "evaluation"))
+            if merged_ram_checkpoint is not None
+            else None
+        ),
+        "ram_baseline_merge_scale": (
+            float(getattr(config, "ram_baseline_merge_scale", 1.0))
+            if merged_ram_checkpoint is not None
+            else None
+        ),
         "base_seed": int(config.validation.base_seed),
         "resolution": int(config.resolution),
         "num_inference_steps": int(config.sample.eval_num_steps),
@@ -451,7 +506,7 @@ def main() -> None:
             mode=args.wandb_mode,
             dir=os.environ.get("WANDB_DIR", "/tmp/wandb"),
         )
-        config_key = "creative_probe_8seed_creative15"
+        config_key = args.wandb_config_key or "creative_probe_8seed_creative15"
         if args.renoising_repeats:
             config_key += f"_renoise{args.renoising_repeats}x"
         wandb.config.update(

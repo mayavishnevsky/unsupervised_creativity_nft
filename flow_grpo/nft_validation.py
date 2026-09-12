@@ -227,3 +227,67 @@ def render_fixed_validation(
     if world_size > 1:
         dist.barrier()
     return records
+
+
+def log_paired_prompt_grids(
+    *,
+    output_dir,
+    label: str,
+    baseline_records: list[dict],
+    creative_records: list[dict],
+    seeds_per_prompt: int,
+    global_step: int,
+) -> list[dict]:
+    """Log RAM-style top-baseline/bottom-creative grids per prompt."""
+
+    if len(baseline_records) != len(creative_records):
+        raise RuntimeError("baseline and creative render counts differ")
+    paired = {}
+    for baseline, creative in zip(baseline_records, creative_records, strict=True):
+        identity = ("index", "prompt_index", "seed_index", "prompt", "seed")
+        if any(baseline[key] != creative[key] for key in identity):
+            raise RuntimeError("baseline and creative prompt/latent records differ")
+        paired.setdefault(baseline["prompt_index"], []).append((baseline, creative))
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    panels = []
+    manifests = []
+    for prompt_index in sorted(paired):
+        samples = sorted(paired[prompt_index], key=lambda pair: pair[0]["seed_index"])
+        if len(samples) != seeds_per_prompt:
+            raise RuntimeError(
+                f"prompt {prompt_index} has {len(samples)} of "
+                f"{seeds_per_prompt} expected seed pairs"
+            )
+        prompt = samples[0][0]["prompt"]
+        with Image.open(samples[0][0]["path"]) as image:
+            width, height = image.size
+        panel = Image.new("RGB", (width * seeds_per_prompt, height * 2))
+        seeds = []
+        for column, (baseline, creative) in enumerate(samples):
+            with Image.open(baseline["path"]) as image:
+                panel.paste(image.convert("RGB"), (column * width, 0))
+            with Image.open(creative["path"]) as image:
+                panel.paste(image.convert("RGB"), (column * width, height))
+            seeds.append(baseline["seed"])
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:10]
+        path = output_dir / (
+            f"{prompt_index:03d}_{prompt_hash}_{seeds_per_prompt}seeds_comparison.png"
+        )
+        panel.save(path)
+        caption = (
+            "top=frozen baseline, bottom=creative; columns share seeds; "
+            f"seeds={seeds} | {prompt}"
+        )
+        panels.append(wandb.Image(panel, caption=caption))
+        manifests.append(
+            {
+                "prompt_index": prompt_index,
+                "prompt": prompt,
+                "seeds": seeds,
+                "comparison_file": str(path),
+            }
+        )
+    wandb.log({f"creative_probes/{label}": panels}, step=global_step)
+    return manifests

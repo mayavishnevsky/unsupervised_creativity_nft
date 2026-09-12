@@ -260,6 +260,10 @@ def sd3_iem_same_prompt_partiprompts():
     # Disable this for latent-only reuse when cached IEM statistics were
     # produced by a different feature convention or integration schedule.
     creativity.reference_cache_use_iem_statistics = True
+    creativity.reference_model_update = ml_collections.ConfigDict()
+    creativity.reference_model_update.enabled = False
+    creativity.reference_model_update.interval_epochs = 5
+    creativity.reference_model_update.min_remaining_epochs = 3
     creativity.reference_samples_per_epoch = 48
     creativity.reference_bank_size = 4096
     creativity.reference_subset_size = 512
@@ -323,6 +327,22 @@ def sd3_iem_same_prompt_mixed_no_repeat():
     return config
 
 
+def sd3_iem_same_prompt_mixed_no_repeat_cached():
+    """Mixed no-repeat config with an explicitly identified reference cache."""
+
+    config = sd3_iem_same_prompt_mixed_no_repeat()
+    cache_dir = os.environ.get("NFT_REFERENCE_CACHE_DIR", "").strip()
+    cache_spec = os.environ.get("NFT_REFERENCE_CACHE_SPEC_SHA256", "").strip()
+    if not cache_dir or not cache_spec:
+        raise ValueError(
+            "sd3_iem_same_prompt_mixed_no_repeat_cached requires both "
+            "NFT_REFERENCE_CACHE_DIR and NFT_REFERENCE_CACHE_SPEC_SHA256"
+        )
+    config.creativity.reference_cache_dir = cache_dir
+    config.creativity.reference_cache_spec_sha256 = cache_spec
+    return config
+
+
 def sd3_iem_same_prompt_partiprompts_smoke():
     """Two-GPU end-to-end smoke test for the full creativity path."""
 
@@ -345,6 +365,108 @@ def sd3_iem_same_prompt_partiprompts_smoke():
     config.creativity.reference_batch_size = 1
     config.creativity.feature_batch_size = 1
     config.creativity.num_inference_steps = 2
+    config.run_name += "_smoke"
+    config.save_dir += "_smoke"
+    return config
+
+
+def sd3_ram_evaluation_pickscore_clipscore_2gpu():
+    """Train NFT on top of a merged RAM evaluation adapter."""
+
+    config = sd3_iem_same_prompt_partiprompts()
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ram_checkpoint = os.environ.get("NFT_RAM_BASELINE_CHECKPOINT", "").strip()
+    if not ram_checkpoint:
+        raise ValueError("NFT_RAM_BASELINE_CHECKPOINT must identify a RAM checkpoint")
+
+    config.dataset = os.path.join(repo_root, "dataset/pickscore")
+    config.seed = 0
+    config.num_epochs = 10
+    config.save_freq = 1
+    config.eval_freq = 1
+    config.eval_before_training = True
+    config.run_name = os.environ.get(
+        "NFT_RUN_NAME",
+        "nft_sd35m_ram_n0czs37n_eval_merged_pickscore_clipscore_e10",
+    )
+    config.save_dir = os.environ.get(
+        "NFT_RUN_DIR",
+        os.path.join(repo_root, "outputs", config.run_name),
+    )
+
+    # n0czs37n is native SD3.5 Medium, with no CFG-distillation baseline LoRA.
+    config.baseline_lora_path = None
+    config.ram_baseline_checkpoint = ram_checkpoint
+    config.ram_baseline_adapter = "evaluation"
+    config.ram_baseline_merge_scale = float(
+        os.environ.get("NFT_RAM_MERGE_SCALE", "1.0")
+    )
+
+    config.sample.num_steps = 25
+    config.sample.eval_num_steps = 40
+    config.sample.guidance_scale = 1.0
+    config.sample.num_image_per_prompt = 24
+    config.sample.num_prompt_groups = 48
+    config.sample.train_batch_size = 6
+    config.sample.num_batches_per_epoch = 96
+    config.sample.test_batch_size = 2
+    config.sample.global_std = False
+    config.sample.noise_level = 0.7
+
+    config.beta = 0.1
+    config.train.batch_size = 8
+    config.train.gradient_accumulation_steps = 72
+    config.train.beta = 0.01
+    config.train.lora_rank = 32
+    config.train.lora_alpha = 64
+
+    config.reward_fn = ml_collections.ConfigDict(
+        {"pickscore": 1.0, "clipscore": 1.0}
+    )
+    config.reward_decode_batch_size = 16
+    config.creativity.enabled = False
+    config.creativity.reference_model_update.enabled = False
+    config.creativity.candidate_prompt_sampling_mode = "independent_epoch"
+    config.creativity.candidate_prompt_source_weights = None
+    config.candidate_diversity.method = "none"
+
+    config.validation.prompt_files = [
+        os.path.join(repo_root, "dataset/pickscore/test.txt")
+    ]
+    config.validation.prompt_count = 30
+    config.validation.batch_size = 2
+    config.validation.base_seed = 0
+    config.validation.prompt_seed = 0
+
+    config.creative_probes = probes = ml_collections.ConfigDict()
+    probes.enabled = True
+    probes.prompt_file = os.environ.get(
+        "NFT_CREATIVE_PROBE_FILE",
+        os.path.join(repo_root, "dataset/creative_probes.txt"),
+    )
+    probes.seeds_per_prompt = 8
+    probes.batch_size = 2
+    probes.ram_style_paired_grids = True
+    return config
+
+
+def sd3_ram_evaluation_pickscore_clipscore_2gpu_smoke():
+    """One-GPU end-to-end check of RAM merging and both image rewards."""
+
+    config = sd3_ram_evaluation_pickscore_clipscore_2gpu()
+    config.num_epochs = 1
+    config.sample.num_steps = 2
+    config.sample.eval_num_steps = 2
+    config.sample.num_image_per_prompt = 2
+    config.sample.num_prompt_groups = 1
+    config.sample.train_batch_size = 2
+    config.sample.num_batches_per_epoch = 1
+    config.train.batch_size = 2
+    config.train.gradient_accumulation_steps = 1
+    config.validation.prompt_count = 1
+    config.validation.batch_size = 1
+    config.reward_decode_batch_size = 1
+    config.creative_probes.enabled = False
     config.run_name += "_smoke"
     config.save_dir += "_smoke"
     return config
